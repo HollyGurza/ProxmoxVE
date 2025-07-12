@@ -56,9 +56,6 @@
       "includeGlobs": [
         "misc/*.func",
         "misc/create_lxc.sh"
-      ],
-      "excludeGlobs": [
-        "misc/api.func"
       ]
     }
   ],
@@ -71,16 +68,6 @@
       "excludeGlobs": [
         "frontend/public/json/**"
       ]
-    }
-  ],
-  "api": [
-    {
-      "fileStatus": null,
-      "includeGlobs": [
-        "api/**",
-        "misc/api.func"
-      ],
-      "excludeGlobs": []
     }
   ],
   "github": [
