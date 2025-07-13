@@ -13,9 +13,17 @@ setting_up_container
 network_check
 update_os
 
+msg_info "Create qbittorrent user"
+if ! id -u qbittorrent >/dev/null 2>&1; then
+  useradd -u 1000 -m -s /usr/sbin/nologin qbittorrent
+  msg_ok "User qbittorrent created"
+else
+  msg_ok "User qbittorrent already exists"
+fi
+
 msg_info "Setup qBittorrent-nox"
 $STD apt-get install -y qbittorrent-nox
-mkdir -p ~/.config/qBittorrent/
+mkdir -p /home/qbittorrent/.config/qBittorrent/
 QB_PASS=$(random_password 20)
 QB_SALT=$(random_password 16)
 QB_HASH="$(printf '%s' "$QB_SALT" | base64 -w0):$(openssl kdf -keylen 64 -kdfopt digest:SHA512 -kdfopt pass:"$QB_PASS" -kdfopt salt:"$QB_SALT" -kdfopt iter:100000 -binary PBKDF2 | base64 -w0)"
@@ -24,7 +32,7 @@ QB_HASH="$(printf '%s' "$QB_SALT" | base64 -w0):$(openssl kdf -keylen 64 -kdfopt
   echo "Username: admin"
   echo "Password: ${QB_PASS}"
 } >~/qbittorrent.creds
-cat <<EOF >~/.config/qBittorrent/qBittorrent.conf
+cat <<EOF >/home/qbittorrent/.config/qBittorrent/qBittorrent.conf
 [LegalNotice]
 Accepted=true
 
@@ -45,11 +53,15 @@ cat <<EOF >/etc/systemd/system/qbittorrent-nox.service
 Description=qBittorrent client
 After=network.target
 [Service]
+User=qbittorrent
+Group=qbittorrent
+Type=simple
 ExecStart=/usr/bin/qbittorrent-nox
 Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
+chown -R qbittorrent:qbittorrent /home/qbittorrent/
 systemctl enable -q --now qbittorrent-nox
 msg_ok "Created Service"
 
