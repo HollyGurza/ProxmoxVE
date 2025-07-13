@@ -14,13 +14,9 @@ network_check
 update_os
 
 msg_info "Setup qBittorrent-nox"
-FULLRELEASE=$(curl -fsSL https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases/latest | grep "tag_name" | awk '{print substr($2, 2, length($2)-3) }')
-RELEASE=$(echo $FULLRELEASE | cut -c 9-13)
-mkdir -p /opt/qbittorrent
-curl -fsSL "https://github.com/userdocs/qbittorrent-nox-static/releases/download/${FULLRELEASE}/x86_64-qbittorrent-nox" -o /opt/qbittorrent/qbittorrent-nox
-chmod +x /opt/qbittorrent/qbittorrent-nox
-mkdir -p $HOME/.config/qBittorrent/
-cat <<EOF >$HOME/.config/qBittorrent/qBittorrent.conf
+$STD apt-get install -y qbittorrent-nox
+mkdir -p /.config/qBittorrent/
+cat <<EOF >/.config/qBittorrent/qBittorrent.conf
 [LegalNotice]
 Accepted=true
 
@@ -30,7 +26,6 @@ WebUI\Port=8090
 WebUI\UseUPnP=false
 WebUI\Username=admin
 EOF
-echo "${RELEASE}" >/opt/${APPLICATION}_version.txt
 msg_ok "Setup qBittorrent-nox"
 
 msg_info "Creating Service"
@@ -38,13 +33,9 @@ cat <<EOF >/etc/systemd/system/qbittorrent-nox.service
 [Unit]
 Description=qBittorrent client
 After=network.target
-
 [Service]
-Type=simple
-User=root
-ExecStart=/opt/qbittorrent/qbittorrent-nox
+ExecStart=/usr/bin/qbittorrent-nox
 Restart=always
-
 [Install]
 WantedBy=multi-user.target
 EOF
