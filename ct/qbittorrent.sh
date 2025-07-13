@@ -29,24 +29,10 @@ function update_script() {
     msg_error "No ${APP} Installation Found!"
     exit
   fi
-  if [[ ! -f ~/.qbittorrent ]]; then
-    msg_error "Please create new qBittorrent LXC. Updating from v4.x to v5.x is not supported!"
-    exit
-  fi
-  if check_for_gh_release "qbittorrent" "userdocs/qbittorrent-nox-static"; then
-    msg_info "Stopping Service"
-    systemctl stop qbittorrent-nox
-    msg_ok "Stopped Service"
-
-    rm -f /opt/qbittorrent/qbittorrent-nox
-    fetch_and_deploy_gh_release "qbittorrent" "userdocs/qbittorrent-nox-static" "singlefile" "latest" "/opt/qbittorrent" "$(arch_resolve "x86_64" "aarch64")-qbittorrent-nox"
-    mv /opt/qbittorrent/qbittorrent /opt/qbittorrent/qbittorrent-nox
-
-    msg_info "Starting Service"
-    systemctl start qbittorrent-nox
-    msg_ok "Started Service"
-    msg_ok "Updated successfully!"
-  fi
+  msg_info "Updating ${APP} LXC"
+  $STD apt-get update
+  $STD apt-get -y upgrade
+  msg_ok "Updated ${APP} LXC"
   exit
 }
 

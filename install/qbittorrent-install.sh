@@ -13,10 +13,8 @@ setting_up_container
 network_check
 update_os
 
-fetch_and_deploy_gh_release "qbittorrent" "userdocs/qbittorrent-nox-static" "singlefile" "latest" "/opt/qbittorrent" "$(arch_resolve "x86_64" "aarch64")-qbittorrent-nox"
-
 msg_info "Setup qBittorrent-nox"
-mv /opt/qbittorrent/qbittorrent /opt/qbittorrent/qbittorrent-nox
+$STD apt-get install -y qbittorrent-nox
 mkdir -p ~/.config/qBittorrent/
 QB_PASS=$(random_password 20)
 QB_SALT=$(random_password 16)
@@ -46,13 +44,9 @@ cat <<EOF >/etc/systemd/system/qbittorrent-nox.service
 [Unit]
 Description=qBittorrent client
 After=network.target
-
 [Service]
-Type=simple
-User=root
-ExecStart=/opt/qbittorrent/qbittorrent-nox
+ExecStart=/usr/bin/qbittorrent-nox
 Restart=always
-
 [Install]
 WantedBy=multi-user.target
 EOF
