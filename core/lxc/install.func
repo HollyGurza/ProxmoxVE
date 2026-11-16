@@ -1,0 +1,1947 @@
+#!/usr/bin/env bash
+# Copyright (c) 2021-2026 community-scripts ORG
+# Author: tteck (tteckster)
+# Co-Author: MickLesk
+# Co-Author: michelroegl-brunner
+# License: MIT | https://github.com/community-scripts/core/raw/main/LICENSE
+
+# ==============================================================================
+# INSTALL.FUNC - UNIFIED CONTAINER INSTALLATION & SETUP
+# ==============================================================================
+
+# All-in-One install.func supporting official Proxmox LXC templates:
+#   - Debian, Ubuntu, Devuan (apt, systemd/sysvinit)
+#   - Alpine (apk, OpenRC)
+#   - Fedora, Rocky, AlmaLinux, CentOS Stream (dnf, systemd)
+#   - openSUSE (zypper, systemd)
+#   - Gentoo (emerge, OpenRC)
+#   - openEuler (dnf, systemd)
+#
+# Supported templates (pveam available):
+#   almalinux-9/10, alpine-3.x, centos-9-stream, debian-12/13,
+#   devuan-5, fedora-42, gentoo-current, openeuler-25,
+#   opensuse-15.x, rockylinux-9/10, ubuntu-22.04/24.04/25.04
+#
+# Features:
+#   - Automatic OS detection
+#   - Unified package manager abstraction
+#   - Init system abstraction (systemd/OpenRC/sysvinit)
+#   - Network connectivity verification
+#   - MOTD and SSH configuration
+#   - Container customization
+#
+# ==============================================================================
+
+# ==============================================================================
+# SECTION 1: INITIALIZATION & OS DETECTION
+# ==============================================================================
+
+# Global variables for OS detection
+
+# ── Engine URL (container side) ───────────────────────────────────────────────
+# Inside the container there is no _cs_source_func resolver, so names are
+# folder-qualified paths relative to the repo root, same as on the host.
+_cs_core_url() {
+  echo "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}/${1:?func path}"
+}
+
+_CS_CURL_RETRY=(--retry 3 --retry-delay 1 --retry-connrefused --connect-timeout 10)
+
+# curl -S prints one line per failed attempt, so a download that recovers on the
+
+_cs_curl_retry() {
+  local url="${1:?url}" err rc=0
+  local attempt=1 max_attempts=4 backoff=1 timeout=30
+
+  err="$(mktemp 2>/dev/null)" || {
+    curl -fsSL --connect-timeout 10 --max-time "$timeout" "$url"
+    return
+  }
+
+  while [[ $attempt -le $max_attempts ]]; do
+    if curl -fsSL --connect-timeout 10 --max-time "$timeout" "$url" 2>"$err"; then
+      rm -f "$err"
+      return 0
+    else
+      rc=$?
+    fi
+    ((attempt == max_attempts)) && break
+    sleep "$backoff"
+    backoff=$((backoff * 2))
+    ((backoff > 30)) && backoff=30
+    timeout=$((timeout * 2))
+    ((attempt++))
+  done
+
+  cat "$err" >&2
+  rm -f "$err"
+  return "$rc"
+}
+
+# The host's prefetch cannot reach a container's filesystem, so fetch the
+# engine concurrently on this side too. verify-split-files.yml checks the list.
+_CS_CT_ENGINE_FILES=(
+  core/core.func core/error_handler.func
+  api/exitcodes.func api/errorlog.func
+  lib/tools.func lib/alpine.func lib/db.func lib/forge.func
+  lib/hwaccel.func lib/runtime.func lib/system.func
+)
+
+_cs_ct_prefetch_engine() {
+  [[ -n "${COMMUNITY_SCRIPTS_CORE_DIR:-}" ]] && return 0
+  [[ "${COMMUNITY_SCRIPTS_NO_PREFETCH:-0}" == "1" ]] && return 1
+  command -v curl >/dev/null 2>&1 || return 1
+
+  local ver major minor
+  ver="$(curl --version 2>/dev/null | head -1 | awk '{print $2}')" || return 1
+  major="${ver%%.*}"
+  minor="${ver#*.}"
+  minor="${minor%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+  ((major > 7 || (major == 7 && minor >= 66))) || return 1
+
+  local base dir=""
+  for base in /dev/shm "${TMPDIR:-/tmp}" /tmp; do
+    [[ -d "$base" && -w "$base" ]] || continue
+    dir="$(mktemp -d "${base}/cs-engine.XXXXXX" 2>/dev/null)" && break
+    dir=""
+  done
+  [[ -z "$dir" ]] && return 1
+
+  local args=() rel core_base
+  core_base="${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}"
+  mkdir -p "${dir}/core" "${dir}/api" "${dir}/lib" 2>/dev/null || true
+  for rel in "${_CS_CT_ENGINE_FILES[@]}"; do
+    args+=(-o "${dir}/${rel}" "${core_base}/${rel}")
+  done
+
+  curl -fsSL --parallel --parallel-immediate --parallel-max 16 \
+    "${_CS_CURL_RETRY[@]}" --max-time 60 "${args[@]}" 2>/dev/null
+
+  local kept=0
+  for rel in "${_CS_CT_ENGINE_FILES[@]}"; do
+    if [[ -s "${dir}/${rel}" ]]; then
+      kept=$((kept + 1))
+    else
+      rm -f "${dir}/${rel}" 2>/dev/null
+    fi
+  done
+  if ((kept == 0)); then
+    rm -rf "$dir" 2>/dev/null
+    return 1
+  fi
+
+  COMMUNITY_SCRIPTS_CORE_DIR="$dir"
+  export COMMUNITY_SCRIPTS_CORE_DIR
+  return 0
+}
+
+# Prefetched copy when there is one, network otherwise.
+_cs_engine_read() {
+  local name="${1:?func path}"
+  local copy="${COMMUNITY_SCRIPTS_CORE_DIR:-}/${name}"
+  if [[ -n "${COMMUNITY_SCRIPTS_CORE_DIR:-}" && -s "$copy" ]]; then
+    cat "$copy"
+    return 0
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    _cs_curl_retry "$(_cs_core_url "$name")"
+  else
+    wget -qO- "$(_cs_core_url "$name")"
+  fi
+}
+
+OS_TYPE=""     # debian, ubuntu, devuan, alpine, fedora, rocky, alma, centos, opensuse, gentoo, openeuler
+OS_FAMILY=""   # debian, alpine, rhel, suse, gentoo, arch
+OS_VERSION=""  # Version number
+PKG_MANAGER="" # apt, apk, dnf, yum, zypper, emerge
+INIT_SYSTEM="" # systemd, openrc, sysvinit
+
+# ------------------------------------------------------------------------------
+# detect_os()
+#
+# Detects the operating system and sets global variables:
+#   OS_TYPE, OS_FAMILY, OS_VERSION, PKG_MANAGER, INIT_SYSTEM
+# ------------------------------------------------------------------------------
+detect_os() {
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_TYPE="${ID:-unknown}"
+    # Normalize to lowercase: some distros ship mixed-case IDs (e.g. openEuler ID="openEuler")
+    OS_TYPE="${OS_TYPE,,}"
+    OS_VERSION="${VERSION_ID:-unknown}"
+  elif [[ -f /etc/alpine-release ]]; then
+    OS_TYPE="alpine"
+    OS_VERSION=$(cat /etc/alpine-release)
+  elif [[ -f /etc/debian_version ]]; then
+    OS_TYPE="debian"
+    OS_VERSION=$(cat /etc/debian_version)
+  elif [[ -f /etc/redhat-release ]]; then
+    OS_TYPE="centos"
+    OS_VERSION=$(grep -oE '[0-9]+\.[0-9]+' /etc/redhat-release | head -1)
+  elif [[ -f /etc/arch-release ]]; then
+    OS_TYPE="arch"
+    OS_VERSION="rolling"
+  elif [[ -f /etc/gentoo-release ]]; then
+    OS_TYPE="gentoo"
+    OS_VERSION=$(cat /etc/gentoo-release | grep -oE '[0-9.]+')
+  else
+    OS_TYPE="unknown"
+    OS_VERSION="unknown"
+  fi
+
+  # Normalize OS type and determine family
+  case "$OS_TYPE" in
+  debian)
+    OS_FAMILY="debian"
+    PKG_MANAGER="apt"
+    ;;
+  ubuntu)
+    OS_FAMILY="debian"
+    PKG_MANAGER="apt"
+    ;;
+  devuan)
+    OS_FAMILY="debian"
+    PKG_MANAGER="apt"
+    ;;
+  kali)
+    OS_FAMILY="debian"
+    PKG_MANAGER="apt"
+    ;;
+  # /etc/os-release says linuxmint; the image catalog and var_os say mint.
+  linuxmint | mint)
+    OS_TYPE="mint"
+    OS_FAMILY="debian"
+    PKG_MANAGER="apt"
+    ;;
+  alpine)
+    OS_FAMILY="alpine"
+    PKG_MANAGER="apk"
+    ;;
+  fedora)
+    OS_FAMILY="rhel"
+    PKG_MANAGER="dnf"
+    ;;
+  rocky | rockylinux)
+    OS_TYPE="rocky"
+    OS_FAMILY="rhel"
+    PKG_MANAGER="dnf"
+    ;;
+  alma | almalinux)
+    OS_TYPE="alma"
+    OS_FAMILY="rhel"
+    PKG_MANAGER="dnf"
+    ;;
+  centos)
+    OS_FAMILY="rhel"
+    # CentOS 7 uses yum, 8+ uses dnf
+    if [[ "${OS_VERSION%%.*}" -ge 8 ]]; then
+      PKG_MANAGER="dnf"
+    else
+      PKG_MANAGER="yum"
+    fi
+    ;;
+  rhel)
+    OS_FAMILY="rhel"
+    PKG_MANAGER="dnf"
+    ;;
+  openeuler)
+    OS_FAMILY="rhel"
+    PKG_MANAGER="dnf"
+    ;;
+  # Oracle Linux reports ID=ol, Amazon Linux ID=amzn. Both normalize to the
+  # name the image catalog and var_os use, so one spelling covers both ends.
+  ol | oracle | oraclelinux)
+    OS_TYPE="oracle"
+    OS_FAMILY="rhel"
+    PKG_MANAGER="dnf"
+    ;;
+  amzn | amazonlinux)
+    OS_TYPE="amazonlinux"
+    OS_FAMILY="rhel"
+    PKG_MANAGER="dnf"
+    ;;
+  opensuse* | sles)
+    OS_TYPE="opensuse"
+    OS_FAMILY="suse"
+    PKG_MANAGER="zypper"
+    ;;
+  arch | archlinux | archarm)
+    OS_TYPE="arch"
+    OS_FAMILY="arch"
+    PKG_MANAGER="pacman"
+    ;;
+  gentoo)
+    OS_FAMILY="gentoo"
+    PKG_MANAGER="emerge"
+    ;;
+  *)
+    OS_FAMILY="unknown"
+    PKG_MANAGER="unknown"
+    ;;
+  esac
+
+  # Detect init system
+  if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
+    INIT_SYSTEM="systemd"
+  elif command -v rc-service &>/dev/null || [[ -d /etc/init.d && -f /sbin/openrc ]]; then
+    INIT_SYSTEM="openrc"
+  elif [[ -f /etc/inittab ]]; then
+    INIT_SYSTEM="sysvinit"
+  else
+    INIT_SYSTEM="unknown"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Bootstrap: Ensure curl is available and source core functions
+# ------------------------------------------------------------------------------
+# A freshly booted container may not have DNS up yet, and `source <(...)` hides
+# the exit code of whatever produced the stream: a failed download used to source
+# an empty script, and the first call into it failed with "command not found"
+# rather than naming the file that could not be fetched. The probe catches the
+# other half — a truncated response that parses but is missing what we need.
+_bootstrap_die() {
+  local msg="$1" url probe
+  if [[ -n "${2:-}" ]] && command -v curl >/dev/null 2>&1; then
+    url="$(_cs_core_url "$2")"
+    probe="$(curl -sS -o /dev/null -w 'HTTP %{http_code}' --max-time 15 "$url" 2>&1 | tr '\n' ' ')"
+    msg="${msg} from ${url} (${probe% })"
+  fi
+  if declare -f msg_error >/dev/null 2>&1; then
+    msg_error "$msg"
+  else
+    echo "FATAL: $msg" >&2
+  fi
+  # core.func is not loaded yet, so nothing else writes the log the host collects
+  [[ -n "${INSTALL_LOG:-}" ]] && echo "[ERROR] $msg" >>"$INSTALL_LOG" 2>/dev/null
+  exit 115
+}
+
+_bootstrap_source() {
+  local rel="${1:?func path}" probe="${2:?probe function}" content
+  # From the file when prefetched, so the error handler can read a failing line back.
+  if [[ -n "${COMMUNITY_SCRIPTS_CORE_DIR:-}" && -s "${COMMUNITY_SCRIPTS_CORE_DIR}/${rel}" ]]; then
+    source "${COMMUNITY_SCRIPTS_CORE_DIR}/${rel}"
+  else
+    content="$(_cs_engine_read "$rel")" && [[ -n "$content" ]] ||
+      _bootstrap_die "Failed to download ${rel}" "$rel"
+    source /dev/stdin <<<"$content"
+  fi
+  declare -f "$probe" >/dev/null 2>&1 ||
+    _bootstrap_die "${rel} loaded but incomplete (missing ${probe})"
+}
+
+_bootstrap() {
+  # Minimal bootstrap to get curl installed
+  if ! command -v curl &>/dev/null; then
+    printf "\r\e[2K%b" '\033[93m Setup Source \033[m' >&2
+    if command -v apt-get &>/dev/null; then
+      apt-get update &>/dev/null && apt-get install -y curl &>/dev/null
+    elif command -v apk &>/dev/null; then
+      apk update &>/dev/null && apk add curl &>/dev/null
+    elif command -v dnf &>/dev/null; then
+      dnf install -y curl &>/dev/null
+    elif command -v yum &>/dev/null; then
+      yum install -y curl &>/dev/null
+    elif command -v zypper &>/dev/null; then
+      zypper install -y curl &>/dev/null
+    elif command -v pacman &>/dev/null; then
+      pacman -Sy --noconfirm curl &>/dev/null
+    elif command -v emerge &>/dev/null; then
+      # Gentoo stage3 has no curl and no portage tree on first boot.
+      # Sync portage (webrsync = fast snapshot) then prefer binary package.
+      emerge-webrsync --quiet &>/dev/null || emerge --sync --quiet &>/dev/null
+      emerge --quiet --getbinpkg --usepkg net-misc/curl &>/dev/null ||
+        emerge --quiet net-misc/curl &>/dev/null
+    fi
+  fi
+
+  # _cs_engine_read picks curl or wget itself, so nothing needs to be chosen
+  # here — but if the install above left neither, every fetch below returns an
+  # empty stream and gets sourced as an empty script. Say so instead.
+  if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+    echo "ERROR: neither curl nor wget available — cannot bootstrap" >&2
+    exit 1
+  fi
+
+  # Two roots: the engine (core) and the scripts live in separate repos, and
+  # inside the container there is no resolver — the host exports both bases.
+  # Override either independently for fork/branch testing.
+  COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local}"
+  COMMUNITY_SCRIPTS_CORE_URL="${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}"
+
+  # A TMPDIR pointing at something that does not exist kills every mktemp in the
+  # engine. pam_systemd sets /tmp/user/<uid> on some hosts and the directory is
+  # not there in a fresh container, so the first mktemp -d returned 1 and took
+  # the install with it.
+  if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then
+    mkdir -p "$TMPDIR" 2>/dev/null || unset TMPDIR
+  fi
+
+  # Mark container context BEFORE error handling starts: error_handler/on_exit
+  # must write local failure artifacts instead of talking to the telemetry API
+  # (the host is the single telemetry reporter).
+  export TELEMETRY_CONTEXT="container"
+
+  # lxc-attach carries the host's engine directory over; it does not exist in here.
+  if [[ -n "${COMMUNITY_SCRIPTS_CORE_DIR:-}" && ! -d "${COMMUNITY_SCRIPTS_CORE_DIR}" ]]; then
+    unset COMMUNITY_SCRIPTS_CORE_DIR
+  fi
+
+  # Source core functions
+  _cs_ct_prefetch_engine || true
+  _bootstrap_source core/core.func load_functions
+  _bootstrap_source api/exitcodes.func explain_exit_code
+  _bootstrap_source api/errorlog.func _tm_focus
+  _bootstrap_source core/error_handler.func catch_errors
+  # The dev helpers are worth a round trip only when a flag is set: core.func's
+  # timing hooks no-op without them, and error_handler's exit path asks for the
+  # summary with declare -f. The host exports the parsed DEV_MODE_* flags, so
+  # there is nothing to re-parse on this side.
+  if [[ -n "${dev_mode:-}" ]]; then
+    _bootstrap_source core/dev-mode.func parse_dev_mode
+  fi
+  load_functions
+  catch_errors
+
+  get_lxc_ip
+}
+
+# Run bootstrap and OS detection
+_bootstrap
+detect_os
+
+# Persist diagnostics setting inside container (exported from build.func)
+# so addon scripts running later can find the user's choice
+if [[ ! -f /usr/local/community-scripts/diagnostics ]]; then
+  mkdir -p /usr/local/community-scripts
+  echo "DIAGNOSTICS=no" >/usr/local/community-scripts/diagnostics
+fi
+
+# ------------------------------------------------------------------------------
+# post_progress_to_api()
+#
+# - Lightweight progress ping from inside the container
+# - Updates the existing telemetry record status
+# - Arguments:
+#   * $1: status (optional, default: "configuring")
+# - Signals that the installation is actively progressing (not stuck)
+# - Fire-and-forget: never blocks or fails the script
+# - Only executes if DIAGNOSTICS=yes and RANDOM_UUID is set
+# ------------------------------------------------------------------------------
+post_progress_to_api() {
+  # HollyGurza/ProxmoxVE local fork: telemetry is removed, nothing is ever sent.
+  return 0
+}
+
+# ==============================================================================
+# SECTION 2: PACKAGE MANAGER ABSTRACTION
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# pkg_update()
+#
+# Updates package manager cache/database
+# ------------------------------------------------------------------------------
+pkg_update() {
+  # Safety: re-detect if PKG_MANAGER doesn't match available commands
+  if [[ "$PKG_MANAGER" == "apt" ]] && ! command -v apt-get &>/dev/null; then
+    msg_warn "PKG_MANAGER='apt' but apt-get not found (OS: ${OS_TYPE:-unknown}) — re-detecting"
+    detect_os
+  fi
+  if [[ "$PKG_MANAGER" == "apk" ]] && ! command -v apk &>/dev/null; then
+    msg_warn "PKG_MANAGER='apk' but apk not found (OS: ${OS_TYPE:-unknown}) — re-detecting"
+    detect_os
+  fi
+
+  case "$PKG_MANAGER" in
+  apt)
+    if ! $STD apt-get update; then
+      local failed_mirror
+      failed_mirror=$(grep -m1 -oP '(?<=URIs: https?://)[^/]+' /etc/apt/sources.list.d/debian.sources 2>/dev/null || grep -m1 -oP '(?<=deb https?://)[^/]+' /etc/apt/sources.list 2>/dev/null || echo "unknown")
+      # A mirror change cannot fix a resolver problem, and probing them all takes
+      # one to two minutes before reporting "possible CDN synchronization issue".
+      if ! getent hosts deb.debian.org >/dev/null 2>&1 &&
+        ! getent hosts archive.ubuntu.com >/dev/null 2>&1; then
+        msg_error "apt-get update failed and no Debian/Ubuntu host resolves - this is DNS, not the mirror"
+        msg_custom "${INFO:-i}" "${YW:-}" "Check /etc/resolv.conf and that /etc is traversable (o+x)"
+        return 1
+      fi
+
+      msg_warn "apt-get update failed (${failed_mirror}), trying alternate mirrors..."
+      local distro
+      distro=$(. /etc/os-release 2>/dev/null && echo "$ID" || echo "debian")
+
+      local eu_mirrors us_mirrors ap_mirrors
+      if [[ "$distro" == "ubuntu" ]]; then
+        eu_mirrors="de.archive.ubuntu.com fr.archive.ubuntu.com se.archive.ubuntu.com nl.archive.ubuntu.com it.archive.ubuntu.com ch.archive.ubuntu.com mirrors.xtom.de"
+        us_mirrors="us.archive.ubuntu.com archive.ubuntu.com mirrors.edge.kernel.org mirror.csclub.uwaterloo.ca mirrors.ocf.berkeley.edu mirror.math.princeton.edu"
+        ap_mirrors="au.archive.ubuntu.com jp.archive.ubuntu.com kr.archive.ubuntu.com tw.archive.ubuntu.com mirror.aarnet.edu.au"
+      else
+        eu_mirrors="ftp.de.debian.org ftp.fr.debian.org ftp.nl.debian.org ftp.uk.debian.org ftp.ch.debian.org ftp.se.debian.org ftp.it.debian.org ftp.fau.de ftp.halifax.rwth-aachen.de debian.mirror.lrz.de mirror.init7.net debian.ethz.ch mirrors.dotsrc.org debian.mirrors.ovh.net"
+        us_mirrors="ftp.us.debian.org ftp.ca.debian.org debian.csail.mit.edu mirrors.ocf.berkeley.edu mirrors.wikimedia.org debian.osuosl.org mirror.cogentco.com"
+        ap_mirrors="ftp.au.debian.org ftp.jp.debian.org ftp.tw.debian.org ftp.kr.debian.org ftp.hk.debian.org ftp.sg.debian.org mirror.aarnet.edu.au mirror.nitc.ac.in"
+      fi
+
+      local tz regional others
+      tz=$(cat /etc/timezone 2>/dev/null || echo "UTC")
+      case "$tz" in
+      Europe/* | Arctic/*)
+        regional="$eu_mirrors"
+        others="$us_mirrors $ap_mirrors"
+        ;;
+      America/*)
+        regional="$us_mirrors"
+        others="$eu_mirrors $ap_mirrors"
+        ;;
+      Asia/* | Australia/* | Pacific/*)
+        regional="$ap_mirrors"
+        others="$eu_mirrors $us_mirrors"
+        ;;
+      *)
+        regional=""
+        others="$eu_mirrors $us_mirrors $ap_mirrors"
+        ;;
+      esac
+
+      echo 'Acquire::By-Hash "no";' >/etc/apt/apt.conf.d/99no-by-hash
+
+      _try_apt_mirror() {
+        local m=$1
+        for src in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do
+          [[ -f "$src" ]] && sed -i "s|URIs: http[s]*://[^/]*/|URIs: http://${m}/|g; s|deb http[s]*://[^/]*/|deb http://${m}/|g" "$src"
+        done
+        rm -rf /var/lib/apt/lists/*
+        local out
+        out=$(apt-get update 2>&1)
+        if echo "$out" | grep -qi "hashsum\|hash sum"; then
+          msg_warn "Mirror ${m} failed (hash mismatch)"
+          return 1
+        elif echo "$out" | grep -qi "SSL\|certificate"; then
+          msg_warn "Mirror ${m} failed (SSL/certificate error)"
+          return 1
+        elif echo "$out" | grep -q "^E:"; then
+          msg_warn "Mirror ${m} failed (apt-get update error)"
+          return 1
+        else
+          msg_ok "CDN set to ${m}: tests passed"
+          return 0
+        fi
+      }
+
+      _scan_reachable() {
+        local result=""
+        for m in $1; do
+          if timeout 2 bash -c "echo >/dev/tcp/$m/80" 2>/dev/null; then
+            result="$result $m"
+          fi
+        done
+        echo "$result" | xargs
+      }
+
+      local apt_ok=false
+
+      # Phase 1: Scan global mirrors first (independent of local CDN issues)
+      local others_ok
+      others_ok=$(_scan_reachable "$others")
+      local others_pick
+      others_pick=$(printf '%s\n' $others_ok | shuf | head -3 | xargs)
+
+      for mirror in $others_pick; do
+        msg_custom "${INFO}" "${YW}" "Attempting mirror: ${mirror}"
+        if _try_apt_mirror "$mirror"; then
+          apt_ok=true
+          break
+        fi
+      done
+
+      # Phase 2: Try primary mirror
+      if [[ "$apt_ok" != true ]]; then
+        local primary
+        if [[ "$distro" == "ubuntu" ]]; then
+          primary="archive.ubuntu.com"
+        else
+          primary="ftp.debian.org"
+        fi
+        if timeout 2 bash -c "echo >/dev/tcp/$primary/80" 2>/dev/null; then
+          msg_custom "${INFO}" "${YW}" "Attempting mirror: ${primary}"
+          if _try_apt_mirror "$primary"; then
+            apt_ok=true
+          fi
+        fi
+      fi
+
+      # Phase 3: Fall back to regional mirrors
+      if [[ "$apt_ok" != true ]]; then
+        local regional_ok
+        regional_ok=$(_scan_reachable "$regional")
+        local regional_pick
+        regional_pick=$(printf '%s\n' $regional_ok | shuf | head -3 | xargs)
+
+        for mirror in $regional_pick; do
+          msg_custom "${INFO}" "${YW}" "Attempting mirror: ${mirror}"
+          if _try_apt_mirror "$mirror"; then
+            apt_ok=true
+            break
+          fi
+        done
+      fi
+
+      # Phase 4: All auto mirrors failed, prompt user
+      if [[ "$apt_ok" != true ]]; then
+        msg_warn "Multiple mirrors failed (possible CDN synchronization issue)."
+        if [[ "$distro" == "ubuntu" ]]; then
+          msg_warn "Find Ubuntu mirrors at: https://launchpad.net/ubuntu/+archivemirrors"
+        else
+          msg_warn "Find Debian mirrors at: https://www.debian.org/mirror/list"
+        fi
+        # Only ask when there is someone to answer: otherwise the loop spins forever.
+        local mirror_src
+        while ! is_unattended; do
+          mirror_src="$(_cs_stdin_source)" || break
+          read -rp "  Enter a mirror hostname (or 'skip' to abort): " custom_mirror <"$mirror_src" || break
+          [[ -z "$custom_mirror" ]] && continue
+          [[ "$custom_mirror" == "skip" ]] && break
+          [[ ! "$custom_mirror" =~ ^[a-zA-Z0-9._-]+$ ]] && {
+            msg_warn "Invalid hostname format."
+            continue
+          }
+          if _try_apt_mirror "$custom_mirror"; then
+            apt_ok=true
+            break
+          fi
+          msg_warn "Mirror '${custom_mirror}' also failed. Try another or type 'skip'."
+        done
+      fi
+
+      if [[ "$apt_ok" != true ]]; then
+        msg_error "All mirrors failed. Check network or try again later."
+        return 1
+      fi
+    fi
+    ;;
+  apk)
+    if ! $STD apk update; then
+      msg_warn "apk update failed (dl-cdn.alpinelinux.org), trying alternate mirrors..."
+      local alpine_mirrors="mirror.init7.net ftp.halifax.rwth-aachen.de mirrors.edge.kernel.org alpine.mirror.wearetriple.com mirror.leaseweb.com uk.alpinelinux.org dl-2.alpinelinux.org dl-4.alpinelinux.org"
+      local apk_ok=false
+      # Fall back to the fixed order if shuf is absent: an empty list here would
+      # skip every mirror and report "all mirrors failed" without trying one.
+      for m in $(printf '%s\n' $alpine_mirrors | shuf 2>/dev/null || printf '%s\n' $alpine_mirrors); do
+        if timeout 2 bash -c "echo >/dev/tcp/$m/80" 2>/dev/null; then
+          msg_custom "${INFO}" "${YW}" "Attempting mirror: ${m}"
+          cat <<EOF >/etc/apk/repositories
+http://$m/alpine/latest-stable/main
+http://$m/alpine/latest-stable/community
+EOF
+          if $STD apk update; then
+            msg_ok "CDN set to ${m}: tests passed"
+            apk_ok=true
+            break
+          else
+            msg_warn "Mirror ${m} failed"
+          fi
+        fi
+      done
+      if [[ "$apk_ok" != true ]]; then
+        msg_error "All Alpine mirrors failed. Check network or try again later."
+        return 1
+      fi
+    fi
+    ;;
+  dnf)
+    # Speed up DNF: enable parallel downloads if not already configured
+    if [[ -f /etc/dnf/dnf.conf ]] && ! grep -q 'max_parallel_downloads' /etc/dnf/dnf.conf; then
+      echo 'max_parallel_downloads=10' >>/etc/dnf/dnf.conf
+    fi
+    # openEuler: default repos point to repo.openeuler.org (China).
+    # Pick the fastest reachable mirror based on timezone to avoid cross-continent latency.
+    if [[ "${OS_TYPE:-}" == "openeuler" ]] && ls /etc/yum.repos.d/*.repo &>/dev/null 2>&1; then
+      if grep -ql 'repo\.openeuler\.org\|repo\.openeuler\.openatom\.cn' /etc/yum.repos.d/*.repo 2>/dev/null; then
+        local _oe_tz _oe_mirror _oe_candidates=()
+        _oe_tz=$(cat /etc/timezone 2>/dev/null || timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
+        # Build candidate list, best-first for the region
+        case "$_oe_tz" in
+        Europe/* | Arctic/*)
+          _oe_candidates=(
+            "https://ftp.agdsn.de/openeuler/"               # Germany (TU Dresden)
+            "https://mirrors.dotsrc.org/openeuler/"         # Denmark
+            "https://mirror.accum.se/mirror/openeuler.org/" # Sweden
+            "https://ftp.belnet.be/mirror/openeuler/"       # Belgium
+          )
+          ;;
+        America/*)
+          # No dedicated Americas mirror yet — European mirrors still beat China
+          _oe_candidates=(
+            "https://ftp.agdsn.de/openeuler/"
+            "https://mirrors.dotsrc.org/openeuler/"
+            "https://ftp.belnet.be/mirror/openeuler/"
+          )
+          ;;
+        Asia/Singapore | Asia/Kuala_Lumpur | Asia/Jakarta | Asia/Bangkok | Asia/Ho_Chi_Minh)
+          _oe_candidates=(
+            "https://mirror.freedif.org/openEuler/"   # Singapore
+            "https://linux.domainesia.com/openeuler/" # Indonesia
+            "https://mirrors.aliyun.com/openeuler/"   # China (fast in SEA)
+          )
+          ;;
+        Asia/* | Australia/* | Pacific/*)
+          _oe_candidates=(
+            "https://mirrors.aliyun.com/openeuler/"
+            "https://mirrors.huaweicloud.com/openeuler/"
+            "https://mirror.freedif.org/openEuler/"
+          )
+          ;;
+        *)
+          # Unknown timezone — try EU mirrors before falling back to origin
+          _oe_candidates=(
+            "https://ftp.agdsn.de/openeuler/"
+            "https://mirrors.dotsrc.org/openeuler/"
+          )
+          ;;
+        esac
+        # Pick first mirror that responds within 3 s
+        _oe_mirror=""
+        for _m in "${_oe_candidates[@]}"; do
+          if curl -sf --head --max-time 3 "$_m" &>/dev/null; then
+            _oe_mirror="$_m"
+            break
+          fi
+        done
+        if [[ -n "$_oe_mirror" ]]; then
+          sed -i -E \
+            "s|https?://repo\.openeuler\.org/|${_oe_mirror}|g;
+             s|https?://repo\.openeuler\.openatom\.cn/|${_oe_mirror}|g" \
+            /etc/yum.repos.d/*.repo
+        fi
+      fi
+    fi
+    $STD dnf makecache
+    ;;
+  yum)
+    $STD yum makecache
+    ;;
+  zypper)
+    $STD zypper refresh
+    ;;
+  pacman)
+    $STD pacman -Sy --noconfirm
+    ;;
+  emerge)
+    $STD emerge --sync
+    ;;
+  *)
+    msg_error "Unknown package manager: $PKG_MANAGER"
+    return 1
+    ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# pkg_upgrade()
+#
+# Upgrades all installed packages
+# ------------------------------------------------------------------------------
+pkg_upgrade() {
+  # Safety: re-detect if PKG_MANAGER doesn't match available commands
+  if [[ "$PKG_MANAGER" == "apt" ]] && ! command -v apt-get &>/dev/null; then
+    msg_warn "PKG_MANAGER='apt' but apt-get not found (OS: ${OS_TYPE:-unknown}) — re-detecting"
+    detect_os
+  fi
+
+  case "$PKG_MANAGER" in
+  apt)
+    $STD apt-get -o Dpkg::Options::="--force-confold" -y dist-upgrade
+    ;;
+  apk)
+    $STD apk -U upgrade
+    ;;
+  dnf)
+    $STD dnf -y upgrade
+    ;;
+  yum)
+    $STD yum -y update
+    ;;
+  zypper)
+    $STD zypper -n update
+    ;;
+  pacman)
+    $STD pacman -Su --noconfirm
+    ;;
+  emerge)
+    # A full source-based @world rebuild fails under the unprivileged-LXC emerge
+    # sandbox ("Operation not permitted") and OOMs a base container. The stage3
+    # template is recent enough; the portage tree is already synced in pkg_update.
+    # Skip the world rebuild so the base container provisions reliably.
+    :
+    ;;
+  *)
+    msg_error "Unknown package manager: $PKG_MANAGER"
+    return 1
+    ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# pkg_install(packages...)
+#
+# Installs one or more packages
+# Arguments:
+#   packages - List of packages to install
+# ------------------------------------------------------------------------------
+pkg_install() {
+  local packages=("$@")
+  [[ ${#packages[@]} -eq 0 ]] && return 0
+
+  case "$PKG_MANAGER" in
+  apt)
+    $STD apt-get install -y "${packages[@]}"
+    ;;
+  apk)
+    $STD apk add --no-cache "${packages[@]}"
+    ;;
+  dnf)
+    $STD dnf install -y "${packages[@]}"
+    ;;
+  yum)
+    $STD yum install -y "${packages[@]}"
+    ;;
+  zypper)
+    $STD zypper install -y "${packages[@]}"
+    ;;
+  pacman)
+    $STD pacman -S --noconfirm "${packages[@]}"
+    ;;
+  emerge)
+    $STD emerge --quiet "${packages[@]}"
+    ;;
+  *)
+    msg_error "Unknown package manager: $PKG_MANAGER"
+    return 1
+    ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# pkg_remove(packages...)
+#
+# Removes one or more packages
+# ------------------------------------------------------------------------------
+pkg_remove() {
+  local packages=("$@")
+  [[ ${#packages[@]} -eq 0 ]] && return 0
+
+  case "$PKG_MANAGER" in
+  apt)
+    $STD apt-get remove -y "${packages[@]}"
+    ;;
+  apk)
+    $STD apk del "${packages[@]}"
+    ;;
+  dnf)
+    $STD dnf remove -y "${packages[@]}"
+    ;;
+  yum)
+    $STD yum remove -y "${packages[@]}"
+    ;;
+  zypper)
+    $STD zypper remove -y "${packages[@]}"
+    ;;
+  pacman)
+    $STD pacman -R --noconfirm "${packages[@]}"
+    ;;
+  emerge)
+    $STD emerge --quiet --unmerge "${packages[@]}"
+    ;;
+  *)
+    msg_error "Unknown package manager: $PKG_MANAGER"
+    return 1
+    ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# pkg_clean()
+#
+# Cleans package manager cache to free space
+# ------------------------------------------------------------------------------
+pkg_clean() {
+  case "$PKG_MANAGER" in
+  apt)
+    $STD apt-get autoremove -y
+    $STD apt-get autoclean
+    ;;
+  apk)
+    $STD apk cache clean
+    ;;
+  dnf)
+    $STD dnf autoremove -y
+    $STD dnf clean all
+    ;;
+  yum)
+    $STD yum clean all
+    ;;
+  zypper)
+    $STD zypper clean
+    ;;
+  pacman)
+    $STD pacman -Sc --noconfirm
+    ;;
+  emerge)
+    # Skip depclean on a base container: it requires a full @world update first
+    # (which we skip) and can unmerge needed packages or fail ("Operation not
+    # permitted") under the unprivileged-LXC emerge sandbox.
+    :
+    ;;
+  *)
+    return 0
+    ;;
+  esac
+}
+
+# ==============================================================================
+# SECTION 3: SERVICE/INIT SYSTEM ABSTRACTION
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# svc_enable(service)
+#
+# Enables a service to start at boot
+# ------------------------------------------------------------------------------
+svc_enable() {
+  local service="$1"
+  [[ -z "$service" ]] && return 1
+
+  case "$INIT_SYSTEM" in
+  systemd)
+    $STD systemctl enable "$service"
+    ;;
+  openrc)
+    $STD rc-update add "$service" default
+    ;;
+  sysvinit)
+    if command -v update-rc.d &>/dev/null; then
+      $STD update-rc.d "$service" defaults
+    elif command -v chkconfig &>/dev/null; then
+      $STD chkconfig "$service" on
+    fi
+    ;;
+  *)
+    msg_warn "Unknown init system, cannot enable $service"
+    return 1
+    ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# svc_disable(service)
+#
+# Disables a service from starting at boot
+# ------------------------------------------------------------------------------
+svc_disable() {
+  local service="$1"
+  [[ -z "$service" ]] && return 1
+
+  case "$INIT_SYSTEM" in
+  systemd)
+    $STD systemctl disable "$service"
+    ;;
+  openrc)
+    $STD rc-update del "$service" default 2>/dev/null || true
+    ;;
+  sysvinit)
+    if command -v update-rc.d &>/dev/null; then
+      $STD update-rc.d "$service" remove
+    elif command -v chkconfig &>/dev/null; then
+      $STD chkconfig "$service" off
+    fi
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# svc_start(service)
+#
+# Starts a service immediately
+# ------------------------------------------------------------------------------
+svc_start() {
+  local service="$1"
+  [[ -z "$service" ]] && return 1
+
+  case "$INIT_SYSTEM" in
+  systemd)
+    $STD systemctl start "$service"
+    ;;
+  openrc)
+    $STD rc-service "$service" start
+    ;;
+  sysvinit)
+    $STD /etc/init.d/"$service" start
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# svc_stop(service)
+#
+# Stops a running service
+# ------------------------------------------------------------------------------
+svc_stop() {
+  local service="$1"
+  [[ -z "$service" ]] && return 1
+
+  case "$INIT_SYSTEM" in
+  systemd)
+    $STD systemctl stop "$service"
+    ;;
+  openrc)
+    $STD rc-service "$service" stop
+    ;;
+  sysvinit)
+    $STD /etc/init.d/"$service" stop
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# svc_restart(service)
+#
+# Restarts a service
+# ------------------------------------------------------------------------------
+svc_restart() {
+  local service="$1"
+  [[ -z "$service" ]] && return 1
+
+  case "$INIT_SYSTEM" in
+  systemd)
+    $STD systemctl restart "$service"
+    ;;
+  openrc)
+    $STD rc-service "$service" restart
+    ;;
+  sysvinit)
+    $STD /etc/init.d/"$service" restart
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# svc_status(service)
+#
+# Gets service status (returns 0 if running)
+# ------------------------------------------------------------------------------
+svc_status() {
+  local service="$1"
+  [[ -z "$service" ]] && return 1
+
+  case "$INIT_SYSTEM" in
+  systemd)
+    systemctl is-active --quiet "$service"
+    ;;
+  openrc)
+    rc-service "$service" status &>/dev/null
+    ;;
+  sysvinit)
+    /etc/init.d/"$service" status &>/dev/null
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# svc_reload_daemon()
+#
+# Reloads init system daemon configuration (for systemd)
+# ------------------------------------------------------------------------------
+svc_reload_daemon() {
+  case "$INIT_SYSTEM" in
+  systemd)
+    $STD systemctl daemon-reload
+    ;;
+  *)
+    # Other init systems don't need this
+    return 0
+    ;;
+  esac
+}
+
+# ==============================================================================
+# SECTION 4: NETWORK & CONNECTIVITY
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# get_ip()
+#
+# Gets the primary IPv4 address of the container
+# Returns: IP address string
+# ------------------------------------------------------------------------------
+get_ip() {
+  local ip=""
+
+  # Try hostname -I first (most common)
+  if command -v hostname &>/dev/null; then
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+  fi
+
+  # Fallback to ip command
+  if [[ -z "$ip" ]] && command -v ip &>/dev/null; then
+    ip=$(ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+  fi
+
+  # Fallback to ifconfig
+  if [[ -z "$ip" ]] && command -v ifconfig &>/dev/null; then
+    ip=$(ifconfig | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+  fi
+
+  echo "$ip"
+}
+
+# ------------------------------------------------------------------------------
+# verb_ip6()
+#
+# Configures IPv6 based on IPV6_METHOD variable
+# If IPV6_METHOD=disable: disables IPv6 via sysctl
+# ------------------------------------------------------------------------------
+verb_ip6() {
+  set_std_mode # Set STD mode based on VERBOSE
+
+  if [[ "${IPV6_METHOD:-}" == "disable" ]]; then
+    if [[ ! -d /proc/sys/net/ipv6 ]]; then
+      msg_ok "IPv6 is already disabled by the host kernel"
+      return 0
+    fi
+    msg_info "Disabling IPv6 (this may affect some services)"
+    mkdir -p /etc/sysctl.d
+    cat >/etc/sysctl.d/99-disable-ipv6.conf <<EOF
+# Disable IPv6 (set by community-scripts)
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+    $STD sysctl -p /etc/sysctl.d/99-disable-ipv6.conf
+
+    # For OpenRC, ensure sysctl runs at boot
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+      $STD rc-update add sysctl default 2>/dev/null || true
+    fi
+    msg_ok "Disabled IPv6"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# setting_up_container()
+#
+# Initial container setup:
+#   - Verifies network connectivity
+#   - Removes Python EXTERNALLY-MANAGED restrictions
+#   - Disables network wait services
+# ------------------------------------------------------------------------------
+setting_up_container() {
+  msg_info "Setting up Container OS"
+
+  # Fix Debian 13 LXC template bug where / is owned by nobody
+  # Only attempt in privileged containers (unprivileged cannot chown /)
+  if [[ "$(stat -c '%U' /)" != "root" ]]; then
+    (chown root:root / 2>/dev/null) || true
+  fi
+
+  # apt fetches as the _apt user, so /etc without o+x means _apt cannot reach
+  # resolv.conf: root pings fine while apt reports "Temporary failure resolving".
+  # A host umask of 027 leaves new containers like this; the PVE GUI's own
+  # containers get 755, so it is collateral rather than intent.
+  local _etc_mode
+  _etc_mode="$(stat -c '%a' /etc 2>/dev/null || echo 755)"
+  if [[ "$_etc_mode" =~ ^[0-7]+$ ]] && (( (8#$_etc_mode & 1) == 0 )); then
+    chmod o+x /etc 2>/dev/null || true
+    msg_warn "/etc was ${_etc_mode}, which stops apt and every other service resolving names - set to $(stat -c '%a' /etc)"
+  fi
+
+  # Debian records the zone name in /etc/timezone, and install scripts read it
+  # (immich, tracearr). PVE templates ship it, the linuxcontainers images used
+  # on Incus ship only the /etc/localtime symlink - so `cat /etc/timezone`
+  # aborted the install after everything else had already been built. Only
+  # fills the gap: where the file exists, nothing here runs.
+  if [[ ! -s /etc/timezone ]]; then
+    local _tz="${tz:-}"
+    if [[ -n "$_tz" && "$_tz" != "host" && -f "/usr/share/zoneinfo/$_tz" ]]; then
+      ln -sf "/usr/share/zoneinfo/$_tz" /etc/localtime 2>/dev/null || true
+    else
+      _tz="$(readlink -f /etc/localtime 2>/dev/null | sed -n 's#.*/zoneinfo/##p')"
+      [[ -z "$_tz" ]] && _tz="Etc/UTC"
+    fi
+    echo "$_tz" >/etc/timezone 2>/dev/null || true
+  fi
+
+  # Wait for network
+  local i
+  for ((i = RETRY_NUM; i > 0; i--)); do
+    if [[ -n "$(get_ip)" ]]; then
+      break
+    fi
+    echo 1>&2 -en "${CROSS}${RD} No Network! "
+    sleep "$RETRY_EVERY"
+  done
+
+  if [[ -z "$(get_ip)" ]]; then
+    echo 1>&2 -e "\n${CROSS}${RD} No Network After $RETRY_NUM Tries${CL}"
+    echo -e "${NETWORK}Check Network Settings"
+    exit 1
+  fi
+
+  # Remove Python EXTERNALLY-MANAGED restriction (Debian 12+, Ubuntu 23.04+)
+  rm -rf /usr/lib/python3.*/EXTERNALLY-MANAGED 2>/dev/null || true
+
+  # Fix locale warnings from perl/apt (e.g. Devuan inherits host locale but hasn't generated it)
+  # C.UTF-8 is always available without locale-gen on any Linux system
+  if [[ "$PKG_MANAGER" == "apt" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export LANGUAGE=C.UTF-8
+    grep -qxF 'LC_ALL=C.UTF-8' /etc/environment 2>/dev/null || echo -e 'LC_ALL=C.UTF-8\nLANG=C.UTF-8' >>/etc/environment
+  fi
+
+  # Arch Linux: pacman 7+ uses Landlock sandboxing for the 'alpm' user, which
+  # requires kernel features unavailable in unprivileged LXC containers.
+  # Disabling DownloadUser falls back to running as root (safe inside an LXC).
+  if [[ "$PKG_MANAGER" == "pacman" && -f /etc/pacman.conf ]]; then
+    sed -i 's/^\s*DownloadUser\s*=.*/#&/' /etc/pacman.conf
+    grep -q '^DisableSandbox' /etc/pacman.conf || sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
+
+    # Initialize pacman keyring (required for signature verification on first
+    # upgrade). The Arch base template ships without an initialized keyring.
+    if [[ ! -f /etc/pacman.d/gnupg/pubring.gpg ]] || [[ ! -s /etc/pacman.d/gnupg/pubring.gpg ]]; then
+      $STD pacman-key --init
+      $STD pacman-key --populate
+    fi
+  fi
+
+  # Disable network wait services for faster boot
+  case "$INIT_SYSTEM" in
+  systemd)
+    systemctl disable -q --now systemd-networkd-wait-online.service 2>/dev/null || true
+    ;;
+  esac
+
+  msg_ok "Set up Container OS"
+  msg_ok "Network Connected: ${BL}$(get_ip)"
+  post_progress_to_api
+}
+
+# ------------------------------------------------------------------------------
+# network_check()
+#
+# Comprehensive network connectivity check for IPv4 and IPv6
+# Tests connectivity to DNS servers and verifies DNS resolution
+# ------------------------------------------------------------------------------
+network_check() {
+  set +e
+  trap - ERR
+  local ipv4_connected=false
+  local ipv6_connected=false
+  sleep 1
+
+  # ICMP is not connectivity. A firewall that permits outbound 80/443 and drops
+  # ping is an ordinary setup, and apt works perfectly behind it -- one reporter
+  # watched this branch condemn a container while the DNS check below resolved
+  # deb.debian.org without complaint. Ping first because it is fast, then ask
+  # the question that matters: can we reach what an install actually needs?
+  _net_tcp_reachable() {
+    local hp host port
+    for hp in "deb.debian.org 443" "github.com 443" "1.1.1.1 443"; do
+      host="${hp% *}"
+      port="${hp#* }"
+      timeout 3 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null && return 0
+    done
+    return 1
+  }
+
+  if ping -c 1 -W 1 1.1.1.1 &>/dev/null || ping -c 1 -W 1 8.8.8.8 &>/dev/null || ping -c 1 -W 1 9.9.9.9 &>/dev/null; then
+    msg_ok "IPv4 Internet Connected"
+    ipv4_connected=true
+  elif _net_tcp_reachable; then
+    msg_ok "IPv4 Internet Connected (TCP reachable; ICMP is filtered)"
+    ipv4_connected=true
+  else
+    msg_error "IPv4 Internet Not Connected"
+  fi
+
+  # Debian's iputils no longer ships a ping6 binary; and missing IPv6 is not an error.
+  local -a _ping6=(ping6)
+  command -v ping6 &>/dev/null || _ping6=(ping -6)
+  if "${_ping6[@]}" -c 1 -W 1 2606:4700:4700::1111 &>/dev/null || "${_ping6[@]}" -c 1 -W 1 2001:4860:4860::8888 &>/dev/null || "${_ping6[@]}" -c 1 -W 1 2620:fe::fe &>/dev/null; then
+    msg_ok "IPv6 Internet Connected"
+    ipv6_connected=true
+  else
+    msg_custom "ℹ️" "${YW}" "No IPv6 Internet (IPv4 is enough)"
+  fi
+
+  # If both IPv4 and IPv6 checks fail, prompt the user
+  if [[ $ipv4_connected == false && $ipv6_connected == false ]]; then
+    # The installer runs under lxc-attach, where stdin is never a terminal, so
+    # this question cannot be asked here at all -- prompt_confirm applied its
+    # "n" default and the exit was reported as "user declined to continue" to
+    # people who were never asked. The host already decided to continue after
+    # its own failed test; contradicting that by destroying the container is the
+    # wrong way to resolve a question nobody could answer.
+    if [[ ! -t 0 ]]; then
+      msg_warn "No Internet detected and no terminal to ask - continuing anyway"
+      echo -e "${INFO}${RD}Expect Issues Without Internet${CL}"
+    elif prompt_confirm "No Internet detected, would you like to continue anyway?" "n"; then
+      echo -e "${INFO}${RD}Expect Issues Without Internet${CL}"
+    else
+      echo -e "${NETWORK}Check Network Settings"
+      exit 122
+    fi
+  fi
+
+  # DNS resolution checks for GitHub-related domains (IPv4 and/or IPv6)
+  local GIT_HOSTS=("github.com" "raw.githubusercontent.com" "api.github.com")
+  local GIT_STATUS="Git DNS:"
+  local DNS_FAILED=false
+
+  for HOST in "${GIT_HOSTS[@]}"; do
+    local RESOLVEDIP
+    RESOLVEDIP=$(getent hosts "$HOST" 2>/dev/null | awk '{ print $1 }' | grep -E '(^([0-9]{1,3}\.){3}[0-9]{1,3}$)|(^[a-fA-F0-9:]+$)' | head -n1)
+    if [[ -z "$RESOLVEDIP" ]]; then
+      GIT_STATUS+="$HOST:(${DNSFAIL:-FAIL})"
+      DNS_FAILED=true
+    else
+      GIT_STATUS+=" $HOST:(${DNSOK:-OK})"
+    fi
+  done
+
+  if [[ "$DNS_FAILED" == true ]]; then
+    fatal "$GIT_STATUS"
+  else
+    msg_ok "$GIT_STATUS"
+  fi
+
+  # Verify APT repository DNS resolution (detect Tailscale MagicDNS / broken resolver)
+  if command -v apt-get &>/dev/null; then
+    local APT_DNS_OK=true
+    for REPO_HOST in "deb.debian.org" "archive.ubuntu.com"; do
+      if ! getent hosts "$REPO_HOST" &>/dev/null; then
+        APT_DNS_OK=false
+        break
+      fi
+    done
+    if [[ "$APT_DNS_OK" == false ]]; then
+      msg_warn "APT repository DNS resolution failed, injecting public DNS servers"
+      echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" >/etc/resolv.conf
+    fi
+  fi
+
+  set -e
+  trap 'error_handler' ERR
+}
+
+# ==============================================================================
+# SECTION 5: OS UPDATE & PACKAGE MANAGEMENT
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# update_os()
+#
+# Updates container OS and sources appropriate tools.func
+# ------------------------------------------------------------------------------
+update_os() {
+  # Scripts write a package's config before installing it; dpkg then asked about
+  # the conffile with no terminal and the install failed.
+  _CS_CONFFILE_QUIET=1
+  declare -f apt_conffile_guard >/dev/null 2>&1 && apt_conffile_guard
+  msg_info "Updating Container OS"
+  configure_http_proxy
+
+  # Configure APT cacher proxy if enabled (Debian/Ubuntu only)
+  if [[ "$PKG_MANAGER" == "apt" && "${CACHER:-}" == "yes" && -z "${HTTP_PROXY:-${http_proxy:-}}" ]]; then
+    echo 'Acquire::http::Proxy-Auto-Detect "/usr/local/bin/apt-proxy-detect.sh";' >/etc/apt/apt.conf.d/00aptproxy
+    local _proxy_raw="${CACHER_IP}"
+    local _proxy_host _proxy_port _proxy_url
+    # Parse host and port from URL or plain IP/hostname
+    _proxy_host=$(echo "$_proxy_raw" | sed -e 's|https\?://||' -e 's|/.*||' | cut -d: -f1)
+    _proxy_port=$(echo "$_proxy_raw" | sed -e 's|https\?://||' -e 's|/.*||' | cut -s -d: -f2)
+    if [[ "$_proxy_raw" =~ ^https?:// ]]; then
+      # Full URL provided — use as-is for proxy output, extract port for nc check
+      _proxy_url="$_proxy_raw"
+      _proxy_port="${_proxy_port:-80}"
+    else
+      # Legacy: plain IP or hostname — default to http + port 3142
+      _proxy_port="${_proxy_port:-3142}"
+      _proxy_url="http://${_proxy_raw}:${_proxy_port}"
+    fi
+    cat <<EOF >/usr/local/bin/apt-proxy-detect.sh
+#!/bin/bash
+if nc -w1 -z "${_proxy_host}" ${_proxy_port}; then
+  echo -n "${_proxy_url}"
+else
+  echo -n "DIRECT"
+fi
+EOF
+    chmod +x /usr/local/bin/apt-proxy-detect.sh
+  fi
+
+  # Re-detect OS to ensure PKG_MANAGER is correct (guards against stale env)
+  detect_os
+
+  # Update and upgrade
+  pkg_update
+  pkg_upgrade
+
+  # PID 1 pins its executor at boot; a systemd upgrade removes the
+  # libsystemd-shared that pinned binary links against, and every service
+  # start then exits 127 (journald, getty) until PID 1 re-executes. Debian's
+  # postinst only tries via deb-systemd-invoke, which policy-rc.d can veto.
+  if [[ -d /run/systemd/system && "$(readlink /proc/1/exe 2>/dev/null)" == *"(deleted)"* ]]; then
+    systemctl daemon-reexec &>/dev/null || true
+    systemctl reset-failed &>/dev/null || true
+    systemctl start systemd-journald.service &>/dev/null || true
+  fi
+
+  # Remove Python EXTERNALLY-MANAGED restriction
+  rm -rf /usr/lib/python3.*/EXTERNALLY-MANAGED 2>/dev/null || true
+
+  msg_ok "Updated Container OS"
+  post_progress_to_api
+
+  # Source appropriate tools.func based on OS. Fetch with curl OR wget: Gentoo
+  # stage3 ships wget but not curl (the curl bootstrap can fall back to wget and
+  # leave curl absent), so a hard curl call fails with "command not found".
+  local tools_content tools_name
+  case "$OS_FAMILY" in
+  alpine) tools_name="lib/alpine.func" ;;
+  *) tools_name="lib/tools.func" ;;
+  esac
+  if [[ -n "${COMMUNITY_SCRIPTS_CORE_DIR:-}" && -s "${COMMUNITY_SCRIPTS_CORE_DIR}/${tools_name}" ]]; then
+    source "${COMMUNITY_SCRIPTS_CORE_DIR}/${tools_name}"
+  else
+    tools_content=$(_cs_engine_read "${tools_name}")
+    if [[ -z "$tools_content" ]]; then
+      msg_error "Failed to download ${tools_name}"
+      exit 115
+    fi
+    source /dev/stdin <<<"$tools_content"
+  fi
+  if ! declare -f fetch_and_deploy_gh_release >/dev/null 2>&1; then
+    msg_error "tools.func loaded but incomplete — missing expected functions"
+    exit 115
+  fi
+}
+
+# ==============================================================================
+# SECTION 6: MOTD & SSH CONFIGURATION
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# motd_ssh()
+#
+# Configures Message of the Day and SSH settings
+# ------------------------------------------------------------------------------
+motd_ssh() {
+  # Set 256-color mode only for SSH sessions; LXC console gets TERM from agetty.
+  # Forcing TERM=xterm-256color on the LXC noVNC console can break readline's
+  # window-size detection and cause CSI 6n response leaks ("R;80R" garbage).
+  if ! grep -q '__cs_term_setup' /root/.bashrc 2>/dev/null; then
+    cat >>/root/.bashrc <<'EOF'
+
+# __cs_term_setup: community-scripts terminal init
+if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]; then
+  export TERM='xterm-256color'
+fi
+EOF
+  fi
+
+  # For LXC login shells (bash_profile runs before readline initialises):
+  # lock TERM=linux on the physical console so readline never queries CPR.
+  # This must run in bash_profile, not bashrc, because login shells source
+  # bash_profile first — readline reads TERM before any profile.d script runs.
+  if ! grep -q '__cs_console_term' /root/.bash_profile 2>/dev/null; then
+    cat >>/root/.bash_profile <<'EOF'
+
+# __cs_console_term: lock TERM=linux on LXC noVNC console to prevent R;80R garbage
+# (readline 8.2+ sends ESC[6n if TERM supports CPR; linux terminfo has no CPR cap)
+if [ -z "${SSH_CONNECTION:-}${SSH_TTY:-}" ]; then
+  _ct=$(tty 2>/dev/null)
+  case "$_ct" in
+    /dev/console|/dev/tty[0-9]*)
+      export TERM=linux ;;
+  esac
+  unset _ct
+
+  # readline 8.3 emits a cursor-position query (ESC[6n) on the noVNC console
+  # whose response leaks into the prompt as "R;80R". TERM=linux does not stop it
+  # on Fedora 43 / Arch, so drain pending input at login, before each prompt and
+  # on window resize.
+  case "$-" in
+  *i*)
+    __cs_drain() {
+      local _j
+      while IFS= read -rst 0.06 -N 128 _j 2>/dev/null; do :; done
+    }
+    __cs_drain
+    trap '__cs_drain' WINCH
+    case "${PROMPT_COMMAND:-}" in
+    *__cs_drain*) : ;;
+    *) PROMPT_COMMAND="__cs_drain${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+    esac
+    ;;
+  esac
+fi
+EOF
+  fi
+
+  # No & or \: update_motd_ip puts this into a sed replacement.
+  local os_line='$(if [ -r /etc/os-release ]; then . /etc/os-release; fi; echo "${NAME:-Linux} - Version: ${VERSION_ID:-rolling}")'
+
+  # Create MOTD profile script. The testing block is conditional -- printed
+  # unconditionally it told every Incus container it was a DevScripts build.
+  local PROFILE_FILE="/etc/profile.d/00_lxc-details.sh"
+  cat >"$PROFILE_FILE" <<EOF
+[ -z "\${SSH_CONNECTION:-}\${SSH_TTY:-}" ] && [ -t 1 ] && printf '\033[3J\033[H\033[2J'
+echo ""
+EOF
+
+  # A script that names a feedback thread does not name a repository: it may
+  # already have been promoted out of DevScripts and still be collecting
+  # feedback, and saying "DevScripts" there would be wrong.
+  if [[ -n "${CS_TESTING_URL:-}" ]]; then
+    cat >>"$PROFILE_FILE" <<EOF
+echo -e "${BOLD:-}${YW:-}${APPLICATION:-Container} LXC Container - TESTING BUILD${CL:-}"
+echo -e "${RD:-}This script is still being tested. Without feedback it cannot be finished.${CL:-}"
+EOF
+  elif [[ "${CS_TESTING:-}" == "yes" ]]; then
+    cat >>"$PROFILE_FILE" <<EOF
+echo -e "${BOLD:-}${YW:-}${APPLICATION:-Container} LXC Container - DEV Repository${CL:-}"
+echo -e "${RD:-}WARNING: This is a DEVELOPMENT version (DevScripts). Do NOT use in production!${CL:-}"
+EOF
+  else
+    cat >>"$PROFILE_FILE" <<EOF
+echo -e "${BOLD:-}${YW:-}${APPLICATION:-Container} LXC Container${CL:-}"
+EOF
+  fi
+
+  cat >>"$PROFILE_FILE" <<EOF
+echo -e "${GATEWAY:-}${YW:-}Provided by: ${GN:-}community-scripts ORG ${YW:-}| GitHub: ${GN:-}https://github.com/community-scripts/ProxmoxVE${CL:-}"
+echo ""
+echo -e "${OS:-}${YW:-}OS: ${GN:-}${os_line}${CL:-}"
+echo -e "${HOSTNAME:-}${YW:-}Hostname: ${GN:-}\$(uname -n)${CL:-}"
+echo -e "${INFO:-}${YW:-}IP Address: ${GN:-}\$(ip -4 route get 1 2>/dev/null | sed -n 's/.* src \\([0-9.]\\+\\).*/\\1/p' | head -1)${CL:-}"
+EOF
+
+  if [[ -n "${CS_TESTING_URL:-}" ]]; then
+    cat >>"$PROFILE_FILE" <<EOF
+echo ""
+echo -e "${YW:-} Report back: ${GN:-}${CS_TESTING_URL}${CL:-}"
+echo -e "${YW:-} Works, broken, or anything odd - one line is enough.${CL:-}"
+EOF
+  elif [[ "${CS_TESTING:-}" == "yes" ]]; then
+    cat >>"$PROFILE_FILE" <<EOF
+echo -e "${YW:-} Repository: ${GN:-}https://github.com/community-scripts/DevScripts${CL:-}"
+EOF
+  fi
+
+  cat >>"$PROFILE_FILE" <<EOF
+echo ""
+EOF
+  # openSUSE's /etc/bash.bashrc sources profile.d via `[ -x ]`, not `[ -r ]`,
+  # so the MOTD script must be executable to be loaded on every distro.
+  chmod +x "$PROFILE_FILE"
+
+  # Also a static /etc/motd: pam_motd reads it on every login regardless of how
+  # profile.d is sourced. Static fields only, the dynamic ones come from the
+  # profile.d script above.
+  if [[ -n "${CS_TESTING_URL:-}" ]]; then
+    cat >/etc/motd <<EOF
+
+${APPLICATION:-Container} LXC Container - TESTING BUILD
+This script is still being tested. Without feedback it cannot be finished.
+
+ Report back: ${CS_TESTING_URL}
+ Works, broken, or anything odd - one line is enough.
+
+EOF
+  elif [[ "${CS_TESTING:-}" == "yes" ]]; then
+    cat >/etc/motd <<EOF
+
+${APPLICATION:-Container} LXC Container - DEV Repository
+WARNING: This is a DEVELOPMENT version (DevScripts). Do NOT use in production!
+ Repository: https://github.com/community-scripts/DevScripts
+
+EOF
+  else
+    cat >/etc/motd <<EOF
+
+${APPLICATION:-Container} LXC Container
+
+EOF
+  fi
+
+  # Disable default MOTD scripts (Debian/Ubuntu)
+  [[ -d /etc/update-motd.d ]] && chmod -x /etc/update-motd.d/* 2>/dev/null || true
+
+  # Configure SSH root access if requested
+  if [[ "${SSH_ROOT:-}" == "yes" ]]; then
+    # Ensure SSH server is installed
+    if [[ ! -f /etc/ssh/sshd_config ]]; then
+      msg_info "Installing SSH server"
+      case "$PKG_MANAGER" in
+      apt)
+        pkg_install openssh-server
+        ;;
+      apk)
+        pkg_install openssh
+        rc-update add sshd default 2>/dev/null || true
+        ;;
+      dnf | yum)
+        pkg_install openssh-server
+        ;;
+      zypper)
+        pkg_install openssh
+        ;;
+      pacman)
+        pkg_install openssh
+        ;;
+      emerge)
+        pkg_install net-misc/openssh
+        ;;
+      esac
+      msg_ok "Installed SSH server"
+    fi
+
+    local sshd_config="/etc/ssh/sshd_config"
+    if [[ -f "$sshd_config" ]]; then
+      sed -i "s/#PermitRootLogin prohibit-password/PermitRootLogin yes/g" "$sshd_config"
+      sed -i "s/PermitRootLogin prohibit-password/PermitRootLogin yes/g" "$sshd_config"
+
+      case "$INIT_SYSTEM" in
+      systemd)
+        svc_restart sshd 2>/dev/null || svc_restart ssh 2>/dev/null || true
+        ;;
+      openrc)
+        svc_enable sshd 2>/dev/null || true
+        svc_start sshd 2>/dev/null || true
+        ;;
+      *)
+        svc_restart sshd 2>/dev/null || true
+        ;;
+      esac
+    fi
+  fi
+  post_progress_to_api
+}
+
+# ==============================================================================
+# SECTION 7: CONTAINER CUSTOMIZATION
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# customize()
+#
+# Customizes container for passwordless login and creates update script
+# ------------------------------------------------------------------------------
+customize() {
+  # debugfs and configfs belong to the host, so an unprivileged container is
+  # refused and boots degraded. Proxmox's Debian and Ubuntu templates mask them
+  # already; the others (openSUSE, linuxcontainers.org images) do not.
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    local _unit
+    for _unit in sys-kernel-debug.mount sys-kernel-config.mount sys-kernel-tracing.mount; do
+      if systemctl is-failed --quiet "$_unit" 2>/dev/null; then
+        systemctl mask "$_unit" &>/dev/null || true
+        systemctl reset-failed "$_unit" &>/dev/null || true
+      fi
+    done
+    # netplan-configure (Ubuntu 26.04) reloads udev after writing its config,
+    # and an unprivileged container has no udev to reload.
+    if systemctl is-failed --quiet netplan-configure.service 2>/dev/null; then
+      mkdir -p /etc/systemd/system/netplan-configure.service.d
+      cat >/etc/systemd/system/netplan-configure.service.d/no-udev.conf <<'EOF'
+[Service]
+ExecStartPost=
+ExecStartPost=-udevadm control --reload
+ExecStartPost=-udevadm trigger --action=add --subsystem-match=net
+EOF
+      systemctl daemon-reload &>/dev/null || true
+      systemctl reset-failed netplan-configure.service &>/dev/null || true
+    fi
+  fi
+
+  if [[ "${PASSWORD:-}" == "" ]]; then
+    msg_info "Customizing Container"
+
+    # Remove root password for auto-login
+    passwd -d root &>/dev/null || true
+
+    case "$INIT_SYSTEM" in
+    systemd)
+      # Mask services that block boot in LXC containers
+      # systemd-homed-firstboot.service hangs waiting for user input on Fedora
+      systemctl mask systemd-homed-firstboot.service &>/dev/null || true
+      systemctl mask systemd-homed.service &>/dev/null || true
+
+      # In LXC there are TWO possible getty paths:
+      #   - container-getty@1.service  -> /dev/tty1 (Proxmox web noVNC console)
+      #   - console-getty.service       -> /dev/console (pct console / serial)
+      # We configure both with --autologin --noissue (prevents banner spam from
+      # rapid respawns) so whichever one the user opens works.
+      # No --noclear: agetty clears tty1 before autologin so leftover boot output
+      # (Fedora 43 systemd prints to the console) doesn't leave a big blank gap
+      # above the login. --noissue keeps it from reprinting the issue on respawn.
+      local _agetty_opts='--autologin root --noissue --keep-baud'
+
+      # container-getty@ hands agetty its pty as stdin (TTYPath=/dev/pts/%I,
+      # since systemd 252), so the line is "-" exactly like the stock unit; on
+      # Proxmox the instances are pts/1 and pts/2, i.e. tty1 and tty2. The
+      # override covers every instance. TERM=linux keeps readline from probing.
+      # A dead getty leaves systemd's own size probe (ESC[6n) echoing on the
+      # console as "24;80R"; the cause of the death was the executor, see update_os.
+      if [[ -f /usr/lib/systemd/system/container-getty@.service ]]; then
+        rm -f /etc/systemd/system/container-getty@1.service.d/override.conf
+        rmdir /etc/systemd/system/container-getty@1.service.d 2>/dev/null || true
+        mkdir -p /etc/systemd/system/container-getty@.service.d
+        cat >/etc/systemd/system/container-getty@.service.d/override.conf <<EOF
+[Service]
+Environment=TERM=linux
+ExecStart=
+ExecStart=-/sbin/agetty ${_agetty_opts} - 115200,38400,9600 linux
+EOF
+      fi
+
+      if [[ -f /usr/lib/systemd/system/console-getty.service ]]; then
+        # LXC's drop-in of the same name in /run has agetty open the console
+        # itself, because systemd 258+ cannot set /dev/console up as stdin in a
+        # container. Ours replaces it, so it has to keep doing that.
+        local _console_port="-" _console_stdio=""
+        if grep -qs '^StandardInput=null' /run/systemd/system/console-getty.service.d/override.conf; then
+          _console_port="console"
+          _console_stdio=$'StandardInput=null\nStandardOutput=null'
+        fi
+        mkdir -p /etc/systemd/system/console-getty.service.d
+        cat >/etc/systemd/system/console-getty.service.d/override.conf <<EOF
+[Service]
+Environment=TERM=linux
+ExecStart=
+ExecStart=-/sbin/agetty ${_agetty_opts} 115200,38400,9600 ${_console_port} linux
+${_console_stdio}
+EOF
+        # Enable console-getty for pct console (not enabled by default on Fedora/RHEL)
+        systemctl enable console-getty.service &>/dev/null || true
+      fi
+
+      # Fedora/RHEL: /etc/profile.d/vte*.sh sets a PROMPT_COMMAND that, combined
+      # with broken TIOCGWINSZ in LXC noVNC, causes CSI 6n responses to leak as
+      # "R;80R" garbage at the shell prompt. Disable by renaming (chmod -x is
+      # ineffective; /etc/profile sources by readability, not executable bit).
+      # Versioned names exist on Fedora 43+ (vte-2.91.sh).
+      shopt -s nullglob
+      for _f in /etc/profile.d/vte*.sh /etc/profile.d/vte*.csh; do
+        mv "$_f" "${_f}.disabled" 2>/dev/null || true
+      done
+      shopt -u nullglob
+
+      # LXC pseudo-tty often reports winsize 0x0; bash readline then falls back
+      # to CSI 6n cursor-position queries whose responses leak as input.
+      # Setting COLUMNS/LINES + stty makes readline skip the query entirely.
+      cat >/etc/profile.d/00-lxc-term-size.sh <<'EOF'
+# community-scripts: ensure sane terminal size in LXC console
+if [ -t 0 ] && [ -t 1 ]; then
+  _sz=$(stty size 2>/dev/null)
+  if [ -z "$_sz" ] || [ "${_sz% *}" = "0" ]; then
+    stty rows 24 cols 80 2>/dev/null
+    export LINES=24 COLUMNS=80
+  fi
+  unset _sz
+fi
+EOF
+      chmod +x /etc/profile.d/00-lxc-term-size.sh
+
+      systemctl daemon-reload
+      # Each instance owns its own pty; a failed one (Kali) needs reset-failed first.
+      systemctl reset-failed 'container-getty@*.service' &>/dev/null || true
+      # The instances come from container_ttys (pts/1 pts/2 on Proxmox, i.e.
+      # tty1 and tty2); a dead one is unloaded and no glob finds it, so name each.
+      local _t
+      for _t in $(tr '\0' '\n' </proc/1/environ 2>/dev/null | sed -n 's/^container_ttys=//p'); do
+        systemctl restart "container-getty@${_t#pts/}.service" &>/dev/null || true
+      done
+      systemctl is-active console-getty.service &>/dev/null && systemctl restart console-getty.service &>/dev/null || true
+      touch /root/.hushlogin
+      ;;
+
+    openrc)
+      # Alpine ships BusyBox getty, not agetty, and the rewrite below names
+      # /sbin/agetty explicitly. Without util-linux the new inittab line points
+      # at a binary that does not exist and the console never comes back.
+      # --force-broken-world: the minirootfs world file can disagree with what is
+      # actually installed, which would otherwise abort the add.
+      if [[ "$PKG_MANAGER" == "apk" ]] && ! command -v agetty &>/dev/null; then
+        $STD apk add --no-cache --force-broken-world util-linux || true
+      fi
+
+      # Alpine/Gentoo inittab formats differ: Alpine uses
+      #   "tty1::respawn:/sbin/getty 38400 tty1"
+      # Gentoo uses
+      #   "1::respawn:/sbin/agetty 38400 tty1"
+      # Match any respawn line running a getty/agetty on tty1 (resp. console) and
+      # rewrite it with --autologin, preserving the original inittab id.
+      if [[ -f /etc/inittab ]]; then
+        if command -v agetty &>/dev/null; then
+          # Re-applied on every boot: a one-time edit does not survive one, which
+          # is why autologin worked on a fresh container and was gone afterwards.
+          mkdir -p /etc/local.d
+          cat >/etc/local.d/autologin.start <<'EOF'
+#!/bin/sh
+sed -i -E 's#^([A-Za-z0-9]*:[0-9]*:respawn:).*[ag]etty.*tty1.*#\1/sbin/agetty --autologin root --noclear tty1 38400 linux#' /etc/inittab
+sed -i -E 's#^([A-Za-z0-9]*:[0-9]*:respawn:).*[ag]etty.*console.*#\1/sbin/agetty --autologin root --noclear console 115200 linux#' /etc/inittab
+kill -HUP 1
+EOF
+          chmod +x /etc/local.d/autologin.start
+          $STD rc-update add local default 2>/dev/null || true
+          /etc/local.d/autologin.start &>/dev/null || true
+          sleep 1
+          pkill -f 'agetty.*tty1' &>/dev/null || true
+          pkill -f 'agetty.*console' &>/dev/null || true
+        else
+          msg_warn "agetty is unavailable — leaving /etc/inittab alone rather than pointing it at a binary that does not exist"
+        fi
+      fi
+      touch /root/.hushlogin
+      ;;
+
+    sysvinit)
+      # Devuan/older SysVinit systems: modify inittab for auto-login on tty1 + console
+      if [[ -f /etc/inittab ]]; then
+        cp /etc/inittab /etc/inittab.bak 2>/dev/null || true
+
+        # Replace the tty1 getty line with an autologin version.
+        # Devuan 5 ships: 1:2345:respawn:/sbin/agetty --noclear tty1 38400 linux
+        sed -i 's|^\(1:[0-9]*:respawn:\).*[ag]etty.*tty1.*|1:2345:respawn:/sbin/agetty --autologin root --noclear tty1 38400 linux|' /etc/inittab
+
+        # Add/replace console entry (pct console maps to /dev/console in some configs)
+        sed -i '/^[^#]*:.*:respawn:.*[ag]etty.*console/d' /etc/inittab
+        sed -i '/^# LXC console autologin/d' /etc/inittab
+        cat >>/etc/inittab <<'EOF'
+
+# LXC console autologin (added by community-scripts)
+co:2345:respawn:/sbin/agetty --autologin root --noclear console 115200 linux
+EOF
+
+        # IMPORTANT: signal init to load the new inittab into memory FIRST,
+        # then kill the running getty — init will respawn it using the new config.
+        # (Killing first causes init to respawn with the OLD in-memory config.)
+        telinit q &>/dev/null || init q &>/dev/null || kill -HUP 1 &>/dev/null || true
+        sleep 1
+        pkill -f '[ag]etty.*tty1' &>/dev/null || true
+        pkill -f '[ag]etty.*console' &>/dev/null || true
+      fi
+      touch /root/.hushlogin
+      ;;
+    esac
+
+    msg_ok "Customized Container"
+  fi
+
+  # Disable readline bracketed-paste on the PVE noVNC console (TERM=linux only):
+  # bash 5.3+/readline 8.3 emit a cursor-position query (ESC[6n) around
+  # bracketed-paste setup whose response leaks into the first prompt as
+  # "R;80R" garbage. Scoped to term=linux so SSH sessions (xterm) keep it.
+  if [[ -d /etc || -f /etc/inputrc ]] && ! grep -q 'enable-bracketed-paste off' /etc/inputrc 2>/dev/null; then
+    cat >>/etc/inputrc <<'EOF'
+
+$if term=linux
+set enable-bracketed-paste off
+$endif
+EOF
+  fi
+
+  # Update entrypoint. write_update_entrypoint (core.func) generates a bootstrap
+  # that pulls the shared update helper, so a script removed upstream explains
+  # itself instead of failing `update` with a raw 404.
+  # $app (NSAPP), not var_os: var_os is set on every container, so an app
+  # container wrote UPDATE_SCRIPT_NAME=debian and `update` pulled ct/debian.sh --
+  # which reported "no update available" for Vaultwarden.
+  local update_script_name="${app:-${var_os:-}}"
+  if declare -f write_update_entrypoint >/dev/null 2>&1; then
+    write_update_entrypoint "$app" "$update_script_name"
+  else
+    # Defensive fallback if core.func is not loaded: legacy direct-pull entrypoint.
+    echo "bash -c \"\$(curl -fsSL ${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local}/ct/${update_script_name}.sh)\"" >/usr/bin/update
+    chmod +x /usr/bin/update
+  fi
+
+  # Inject SSH authorized keys if provided
+  if [[ -n "${SSH_AUTHORIZED_KEY:-}" ]]; then
+    mkdir -p /root/.ssh
+    echo "${SSH_AUTHORIZED_KEY}" >/root/.ssh/authorized_keys
+    chmod 700 /root/.ssh
+    chmod 600 /root/.ssh/authorized_keys
+  fi
+  post_progress_to_api
+}
+
+# ==============================================================================
+# SECTION 8: UTILITY FUNCTIONS
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# validate_tz(timezone)
+#
+# Validates if a timezone is valid
+# Returns: 0 if valid, 1 if invalid
+# ------------------------------------------------------------------------------
+validate_tz() {
+  local tz="$1"
+  [[ -f "/usr/share/zoneinfo/$tz" ]]
+}
+
+# ------------------------------------------------------------------------------
+# set_timezone(timezone)
+#
+# Sets container timezone
+# ------------------------------------------------------------------------------
+set_timezone() {
+  local tz="$1"
+  if validate_tz "$tz"; then
+    ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime
+    echo "$tz" >/etc/timezone 2>/dev/null || true
+
+    # Update tzdata if available
+    case "$PKG_MANAGER" in
+    apt)
+      dpkg-reconfigure -f noninteractive tzdata 2>/dev/null || true
+      ;;
+    esac
+    msg_ok "Timezone set to $tz"
+  else
+    msg_warn "Invalid timezone: $tz"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# os_info()
+#
+# Prints detected OS information (for debugging)
+# ------------------------------------------------------------------------------
+os_info() {
+  echo "OS Type:      $OS_TYPE"
+  echo "OS Family:    $OS_FAMILY"
+  echo "OS Version:   $OS_VERSION"
+  echo "Pkg Manager:  $PKG_MANAGER"
+  echo "Init System:  $INIT_SYSTEM"
+}

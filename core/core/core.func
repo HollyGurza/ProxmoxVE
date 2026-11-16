@@ -1,0 +1,2841 @@
+#!/usr/bin/env bash
+# Copyright (c) 2021-2026 community-scripts ORG
+# License: MIT | https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core/LICENSE
+
+# ==============================================================================
+# CORE FUNCTIONS - LXC CONTAINER UTILITIES
+# ==============================================================================
+#
+# This file provides core utility functions for LXC container management
+# including colors, formatting, validation checks, message output, and
+# execution helpers used throughout the Community-Scripts ecosystem.
+#
+# Usage:
+#   source <(curl -fsSL https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core/core/core.func)
+#   load_functions
+#
+# ==============================================================================
+
+[[ -n "${_CORE_FUNC_LOADED:-}" ]] && return
+_CORE_FUNC_LOADED=1
+
+# Scripts run as root; without this Composer waits at a "Continue as root?" prompt that $STD hides
+export COMPOSER_ALLOW_SUPERUSER=1
+
+if [[ -z "${HOME:-}" ]]; then
+  HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+  export HOME="${HOME:-/root}"
+fi
+
+# ==============================================================================
+# SECTION 1: INITIALIZATION & SETUP
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# load_functions()
+#
+# - Initializes all core utility groups (colors, formatting, icons, defaults)
+# - Ensures functions are loaded only once via __FUNCTIONS_LOADED flag
+# - Must be called at start of any script using these utilities
+# ------------------------------------------------------------------------------
+load_functions() {
+  [[ -n "${__FUNCTIONS_LOADED:-}" ]] && return
+  __FUNCTIONS_LOADED=1
+  color
+  formatting
+  icons
+  default_vars
+  set_std_mode
+}
+
+# ------------------------------------------------------------------------------
+# color()
+#
+# - Sets ANSI color codes for styled terminal output
+# - Variables: YW (yellow), YWB (yellow bright), BL (blue), RD (red)
+#             GN (green), DGN (dark green), BGN (background green), CL (clear)
+# ------------------------------------------------------------------------------
+color() {
+  YW=$(echo "\033[33m")
+  YWB=$'\e[93m'
+  BL=$(echo "\033[36m")
+  RD=$(echo "\033[01;31m")
+  BGN=$(echo "\033[4;92m")
+  GN=$(echo "\033[1;92m")
+  DGN=$(echo "\033[32m")
+  CL=$(echo "\033[m")
+
+  # A dev run repaints the greens red. Every success line, every checkmark and
+  # the header turn the colour of a warning, so a screenshot or a recording is
+  # never mistaken for a normal install.
+  if [[ -n "${dev_mode:-}" ]]; then
+    BGN=$(echo "\033[4;91m")
+    GN=$(echo "\033[1;91m")
+    DGN=$(echo "\033[31m")
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# color_spinner()
+#
+# - Sets ANSI color codes specifically for spinner animation
+# - Variables: CS_YW (spinner yellow), CS_YWB (spinner yellow bright),
+#             CS_CL (spinner clear)
+# - Used by spinner() function to avoid color conflicts
+# ------------------------------------------------------------------------------
+color_spinner() {
+  CS_YW=$'\033[33m'
+  CS_YWB=$'\033[93m'
+  CS_CL=$'\033[m'
+}
+
+# ------------------------------------------------------------------------------
+# formatting()
+#
+# - Defines formatting helpers for terminal output
+# - BFR: Backspace and clear line sequence
+# - BOLD: Bold text escape code
+# - TAB/TAB3: Indentation spacing
+# ------------------------------------------------------------------------------
+formatting() {
+  BFR="\\r\\033[K"
+  BOLD=$(echo "\033[1m")
+  HOLD=" "
+  TAB="  "
+  TAB3="      "
+}
+
+# ------------------------------------------------------------------------------
+# icons()
+#
+# - Sets symbolic emoji icons used throughout user feedback
+# - Provides consistent visual indicators for success, error, info, etc.
+# - Icons: CM (checkmark), CROSS (error), INFO (info), HOURGLASS (wait), etc.
+# ------------------------------------------------------------------------------
+icons() {
+  CM="${TAB}✔️${TAB}"
+  CROSS="${TAB}✖️${TAB}"
+  DNSOK="✔️ "
+  DNSFAIL="${TAB}✖️${TAB}"
+  INFO="${TAB}💡${TAB}${CL}"
+  OVERRIDE="${TAB}🔀${TAB}${CL}"
+  OS="${TAB}🖥️${TAB}${CL}"
+  OSVERSION="${TAB}🌟${TAB}${CL}"
+  CONTAINERTYPE="${TAB}📦${TAB}${CL}"
+  DISKSIZE="${TAB}💾${TAB}${CL}"
+  CPUCORE="${TAB}🧠${TAB}${CL}"
+  RAMSIZE="${TAB}🛠️${TAB}${CL}"
+  SEARCH="${TAB}🔍${TAB}${CL}"
+  VERBOSE_CROPPED="🔍${TAB}"
+  VERIFYPW="${TAB}🔐${TAB}${CL}"
+  CONTAINERID="${TAB}🆔${TAB}${CL}"
+  HOSTNAME="${TAB}🏠${TAB}${CL}"
+  BRIDGE="${TAB}🌉${TAB}${CL}"
+  NETWORK="${TAB}📡${TAB}${CL}"
+  GATEWAY="${TAB}🌐${TAB}${CL}"
+  ICON_DISABLEIPV6="${TAB}🚫${TAB}${CL}"
+  DEFAULT="${TAB}⚙️${TAB}${CL}"
+  MACADDRESS="${TAB}🔗${TAB}${CL}"
+  VLANTAG="${TAB}🏷️${TAB}${CL}"
+  ROOTSSH="${TAB}🔑${TAB}${CL}"
+  CREATING="${TAB}🚀${TAB}${CL}"
+  ADVANCED="${TAB}🧩${TAB}${CL}"
+  FUSE="${TAB}🗂️${TAB}${CL}"
+  GPU="${TAB}🎮${TAB}${CL}"
+  HOURGLASS="${TAB}⏳${TAB}"
+}
+
+# Re-provision a toolchain the container was built with but no longer has.
+#
+# Every setup_* records what it installed under /var/cache/app-versions. When the
+# binary that record promises is gone, a script that compiles on update dies at
+# exit 127 with its service already stopped. 144 ct scripts call a toolchain in
+# their update path without ensuring it first, so this belongs here.
+ensure_recorded_toolchains() {
+  local cache=/var/cache/app-versions
+  [[ -d "$cache" ]] || return 0
+
+  local rec tool bin fn
+  for rec in "$cache"/*_version.txt; do
+    [[ -r "$rec" ]] || continue
+    tool="$(basename "$rec")"
+    tool="${tool%_version.txt}"
+    case "$tool" in
+    rust) bin=cargo fn=setup_rust ;;
+    go) bin=go fn=setup_go ;;
+    nodejs) bin=node fn=setup_nodejs ;;
+    uv) bin=uv fn=setup_uv ;;
+    composer) bin=composer fn=setup_composer ;;
+    yq) bin=yq fn=setup_yq ;;
+    ruby) bin=ruby fn=setup_ruby ;;
+    *) continue ;;
+    esac
+    command -v "$bin" >/dev/null 2>&1 && continue
+    declare -f "$fn" >/dev/null 2>&1 || continue
+    msg_warn "${bin} is recorded for this container but missing - reinstalling"
+    "$fn" || msg_error "Could not restore ${bin}"
+  done
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# ensure_profile_loaded()
+#
+# - Sources /etc/profile.d/*.sh scripts if not already loaded
+# - Fixes PATH issues when running via pct enter/exec (non-login shells)
+# - Safe to call multiple times (uses guard variable)
+# - Should be called in update_script() or any script running inside LXC
+# ------------------------------------------------------------------------------
+ensure_profile_loaded() {
+  # Skip if already loaded or running on Proxmox host
+  [[ -n "${_PROFILE_LOADED:-}" ]] && return
+  command -v pveversion &>/dev/null && return
+
+  # Sourced for their PATH side effects, output discarded: 00_lxc-details.sh
+  # starts with a clear-screen escape and echoes the whole login banner, and the
+  # redirect also makes its own `[ -t 1 ]` guard false. A script ending on a
+  # false conditional makes `source` return that status, which as the final
+  # command of an && list is not exempt from errexit -- that took whole updates
+  # with it.
+  # RHEL's lang.sh reads LC_ALL unguarded; under nounset that ends the shell
+  # before `|| true` gets a say.
+  local nounset=0
+  [[ $- == *u* ]] && nounset=1
+  set +u
+  if [[ -d /etc/profile.d ]]; then
+    for script in /etc/profile.d/*.sh; do
+      [[ -r "$script" ]] || continue
+      source "$script" >/dev/null 2>&1 || true
+    done
+  fi
+
+  # rustup records $HOME/.cargo/bin here and nowhere else, and /usr/bin/update
+  # runs a non-login shell -- so an update that compiles died on "cargo: command
+  # not found" with cargo installed and fine.
+  if [[ -r "${HOME:-/root}/.profile" ]]; then
+    source "${HOME:-/root}/.profile" >/dev/null 2>&1 || true
+  fi
+  ((nounset)) && set -u
+
+  # Also ensure /usr/local/bin is in PATH (common install location)
+  if [[ ":$PATH:" != *":/usr/local/bin:"* ]]; then
+    export PATH="/usr/local/bin:$PATH"
+  fi
+
+  export _PROFILE_LOADED=1
+}
+
+# The retired Gitea mirror; GitHub serves the same repos. Mirrored in
+# misc/update.sh, which cannot source this file.
+# ------------------------------------------------------------------------------
+_cs_live_base() {
+  local u="${1%/}"
+  case "$u" in
+  *//git.community-scripts.org/*)
+    u="${u#*//git.community-scripts.org/}"
+    u="${u/\/raw\/branch\//\/}"
+    u="${u/\/raw\/tag\//\/}"
+    u="${u/\/raw\/commit\//\/}"
+    printf 'https://raw.githubusercontent.com/%s' "$u"
+    ;;
+  *) printf '%s' "$u" ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# write_update_entrypoint()
+#
+# Generates /usr/bin/update as a small self-hosting bootstrap. Instead of pulling
+# the app script directly (which fails with a raw 404 once a script is removed
+# upstream), the bootstrap pulls the shared update helper (misc/update.sh). The
+# helper asks the website whether this app can still be updated before touching
+# anything, and explains a removal instead of erroring out.
+#
+# Called at install time and refreshed on every update (see
+# migrate_update_entrypoint), so containers move onto the new mechanism the next
+# time they update — no per-container migration step needed.
+#
+#   $1 = script slug (for the website status lookup, e.g. "plex")
+#   $2 = update script name (the ct/<name>.sh to pull, e.g. "plex" or an OS name)
+#   $3 = (optional) script base URL; defaults to COMMUNITY_SCRIPTS_URL. Passing it
+#        explicitly lets migration preserve the source a container was built from.
+# ------------------------------------------------------------------------------
+write_update_entrypoint() {
+  local slug="${1:-}" name="${2:-}" base_override="${3:-}"
+  # Without a script name there is nothing to pull; leave any existing entry as-is.
+  [[ -z "$name" ]] && return 0
+
+  local base core_url website
+  base="$(_cs_live_base "${base_override:-${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local}}")"
+  core_url="${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}"
+  website="${COMMUNITY_SCRIPTS_WEBSITE_URL:-https://community-scripts.org}"
+
+  # Temp file in the same directory, then an atomic mv. /usr/bin/update is
+  # usually the script currently running, and it grows from a one-liner to this.
+  # Overwriting in place makes the running shell resume at its old byte offset,
+  # now inside longer content, and execute garbage. mv gives the new content a
+  # fresh inode and the running shell reads the old one to a clean EOF.
+  local tmp
+  tmp="$(mktemp /usr/bin/.update.XXXXXX 2>/dev/null)" || tmp="/usr/bin/.update.tmp.$$"
+
+  # First heredoc is unquoted: the resolved values are baked in as the exports the
+  # bootstrap then reads. Second heredoc is quoted so its ${...} stay literal.
+  cat >"$tmp" <<EOF
+#!/usr/bin/env bash
+# Community-Scripts update entrypoint (generated - do not edit by hand).
+# Regenerated on install and on every successful update.
+export SCRIPT_SLUG="${slug}"
+export UPDATE_SCRIPT_NAME="${name}"
+export COMMUNITY_SCRIPTS_URL="${base}"
+export COMMUNITY_SCRIPTS_CORE_URL="${core_url}"
+export COMMUNITY_SCRIPTS_WEBSITE_URL="${website}"
+EOF
+  cat >>"$tmp" <<'EOF'
+# Pull the shared helper; it decides whether this app can still be updated. If it
+# cannot be fetched, fall back to the legacy direct pull so `update` still works.
+_cs_helper="$(curl -fsSL --connect-timeout 10 "${COMMUNITY_SCRIPTS_CORE_URL}/misc/update.sh" 2>/dev/null)"
+if [[ -n "$_cs_helper" ]]; then
+  bash -c "$_cs_helper"
+else
+  echo "Update helper unavailable - falling back to direct update."
+  bash -c "$(curl -fsSL "${COMMUNITY_SCRIPTS_URL}/ct/${UPDATE_SCRIPT_NAME}.sh")"
+fi
+EOF
+  chmod +x "$tmp"
+  mv -f "$tmp" /usr/bin/update
+}
+
+# ------------------------------------------------------------------------------
+# migrate_update_entrypoint()
+#
+# Moves containers still carrying the old direct-pull /usr/bin/update onto the new
+# bootstrap. Safe to call on every update. It is conservative: if the entrypoint
+# already uses the helper it does nothing, and it preserves the exact script base
+# URL the container was built from by reading it out of the legacy entrypoint,
+# rather than guessing from the current environment.
+# ------------------------------------------------------------------------------
+migrate_update_entrypoint() {
+  # Nothing to do only if it is on the helper, points somewhere that still
+  # serves scripts, and records a usable name.
+  if [[ -f /usr/bin/update ]] &&
+    grep -q "misc/update.sh" /usr/bin/update 2>/dev/null &&
+    ! grep -q "git.community-scripts.org" /usr/bin/update 2>/dev/null &&
+    grep -qE '^export UPDATE_SCRIPT_NAME="[a-zA-Z0-9._-]+"$' /usr/bin/update 2>/dev/null; then
+    return 0
+  fi
+
+  local slug name base=""
+  slug="${SCRIPT_SLUG:-${NSAPP:-${app:-}}}"
+  slug="$(echo "$slug" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
+
+  # Prefer the base + script name recorded in the legacy entrypoint, so the
+  # migrated container keeps pulling from the same repo it always did.
+  if [[ -f /usr/bin/update ]]; then
+    local legacy
+    # No match is normal; grep exiting 1 must not trip the ERR trap.
+    legacy="$(grep -oE 'https?://[^"]+/ct/[^"]+\.sh' /usr/bin/update 2>/dev/null | head -1 || true)"
+    if [[ -n "$legacy" ]]; then
+      base="${legacy%/ct/*}"
+      name="$(basename "${legacy%.sh}")"
+    else
+      # Helper format has no literal url, only the export.
+      name="$(grep -m1 '^export UPDATE_SCRIPT_NAME=' /usr/bin/update 2>/dev/null | cut -d'"' -f2 || true)"
+    fi
+  fi
+
+  base="$(_cs_live_base "$base")"
+
+  # Anything that is not a slug is a damaged entrypoint, not a name.
+  [[ "${name:-}" =~ ^[a-zA-Z0-9._-]+$ ]] || name=""
+
+  # Fall back to the update environment when the legacy line could not be parsed.
+  [[ -z "${name:-}" ]] && name="${NSAPP:-${app:-${var_os:-}}}"
+  [[ -z "$name" ]] && return 0
+
+  write_update_entrypoint "$slug" "$name" "$base" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# default_vars()
+#
+# - Sets default retry and wait variables used for system actions
+# - RETRY_NUM: Maximum number of retry attempts (default: 10)
+# - RETRY_EVERY: Seconds to wait between retries (default: 3)
+# - i: Counter variable initialized to RETRY_NUM
+# ------------------------------------------------------------------------------
+default_vars() {
+  RETRY_NUM=10
+  RETRY_EVERY=3
+  i=$RETRY_NUM
+}
+
+# ------------------------------------------------------------------------------
+# set_std_mode()
+#
+# - Sets default verbose mode for script and OS execution
+# - If VERBOSE=yes: STD="" (show all output)
+# - If VERBOSE=no: STD="silent" (suppress output via silent() wrapper)
+# - If DEV_MODE_TRACE=true: Enables bash tracing (set -x)
+# ------------------------------------------------------------------------------
+# Debian-style architecture of the machine that will run the container: the
+# Incus server when driving a remote, otherwise this host. Needs no dpkg.
+_cs_host_arch() {
+  local a="${INCUS_SERVER_ARCH:-}"
+  [[ -n "$a" ]] || a="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+  case "$a" in
+  x86_64) a="amd64" ;;
+  aarch64) a="arm64" ;;
+  esac
+  printf '%s' "$a"
+}
+
+set_std_mode() {
+  # Verbose shows the output live and still keeps it in the log; silent() reads VERBOSE.
+  STD="silent"
+
+  # Enable bash tracing if trace mode active
+  if [[ "${DEV_MODE_TRACE:-false}" == "true" ]]; then
+    set -x
+    # BASH_SOURCE is empty at the top level of `bash -c` and inside a
+    # `source /dev/stdin`, which is exactly how the install script runs in the
+    # container. Unguarded, set -u aborts the run the moment PS4 is expanded.
+    export PS4='+(${BASH_SOURCE:-?}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+  fi
+}
+
+# `clear` is part of ncurses, which the minimal Fedora and Arch container images
+# do not ship. A bare call there returns 127, and under errexit that aborted the
+# run before it had done anything -- `update` on a fresh Fedora container died on
+# this line. The escape sequence does the same job wherever clear is missing.
+# clear also exits 1 when TERM is unset or dumb, which is how an unattended
+# update runs, and header_info ended it there. Clearing is cosmetic, so it is
+# skipped without a terminal and never fails the run.
+_cs_clear() {
+  [[ -t 1 && "${TERM:-dumb}" != "dumb" ]] || return 0
+  clear 2>/dev/null || printf '\033[H\033[2J\033[3J'
+}
+
+# ==============================================================================
+# SECTION 2: VALIDATION CHECKS
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# shell_check()
+#
+# - Verifies that the script is running under Bash shell
+# - Exits with error message if different shell is detected
+# - Required because scripts use Bash-specific features
+# ------------------------------------------------------------------------------
+shell_check() {
+  if [[ "$(ps -p $$ -o comm=)" != "bash" ]]; then
+    _cs_clear
+    msg_error "Your default shell is currently not set to Bash. To use these scripts, please switch to the Bash shell."
+    echo -e "\nExiting..."
+    sleep 2
+    exit 103 # shell is not Bash
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# root_check()
+#
+# - Verifies script is running with root privileges
+# - Detects if executed via sudo (which can cause issues)
+# - Exits with error if not running as root directly
+# ------------------------------------------------------------------------------
+root_check() {
+  if [[ "$(id -u)" -ne 0 || $(ps -o comm= -p $PPID) == "sudo" ]]; then
+    _cs_clear
+    msg_error "Please run this script as root."
+    echo -e "\nExiting..."
+    sleep 2
+    exit 104 # not running as root
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# on_pve_host()
+#
+# - Returns 0 when executed on a Proxmox VE node, 1 otherwise
+# - Cheap probe used by the guards below; never exits on its own
+# ------------------------------------------------------------------------------
+on_pve_host() {
+  command -v pveversion &>/dev/null
+}
+
+# ------------------------------------------------------------------------------
+# require_pve_host()
+#
+# - Guard for tools that drive the node itself (pct/pveam/pvesm/pvesh/qm)
+# - Aborts when not on a PVE node, then validates the PVE version
+# ------------------------------------------------------------------------------
+require_pve_host() {
+  if ! on_pve_host; then
+    msg_error "${APP:-This script} must be run on the Proxmox VE host."
+    msg_error "Proxmox tooling (pct/pveam/pvesm/qm) is not available here."
+    exit 232
+  fi
+  pve_check
+}
+
+# ------------------------------------------------------------------------------
+# confirm_not_pve_host()
+#
+# - Guard for tools that belong inside an LXC/VM but would technically run
+#   on the node as well
+# - Warns and asks for confirmation instead of hard-failing
+# ------------------------------------------------------------------------------
+confirm_not_pve_host() {
+  on_pve_host || return 0
+
+  msg_error "Running on the Proxmox VE host is NOT recommended!"
+  msg_error "${APP:-This script} is meant to be executed inside an LXC container."
+  echo ""
+  echo -n "${TAB:-  }Continue anyway? (y/N): "
+  local confirm
+  declare -f reclaim_tty >/dev/null 2>&1 && reclaim_tty
+  read -r confirm </dev/tty || true
+  if [[ ! "${confirm,,}" =~ ^(y|yes)$ ]]; then
+    msg_warn "Aborted. Please run this inside an LXC container."
+    exit 0
+  fi
+  msg_warn "Proceeding on the Proxmox VE host at your own risk!"
+}
+
+# ------------------------------------------------------------------------------
+# require_debian_like()
+#
+# - Guard for addons that have no Alpine code path
+# - Aborts early instead of failing halfway through with apt/systemd errors
+# ------------------------------------------------------------------------------
+require_debian_like() {
+  if is_alpine; then
+    msg_error "${APP:-This script} does not support Alpine Linux."
+    msg_error "Please use a Debian or Ubuntu based LXC container."
+    exit 238
+  fi
+  if ! command -v apt-get &>/dev/null; then
+    msg_error "${APP:-This script} requires a Debian or Ubuntu based system."
+    exit 238
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# pve_check()
+#
+# - Validates Proxmox VE version compatibility
+# - Supported: PVE 8.0-8.9 and PVE 9.0-9.2
+# - Exits with error message if unsupported version detected
+# ------------------------------------------------------------------------------
+# pveversion and `pveam available` are Perl programs answering the same thing
+# all run: the host version and the template catalog. They were invoked 4 and 9
+# times, each a fresh process.
+#
+# The cache is a file, not a variable. Every call site reads these through a
+# pipe or $( ), which is a subshell — a variable assigned in there is gone the
+# moment it returns, so a shell-variable memo would never hit. $$ stays the
+# parent's pid inside a subshell, which makes the path the same for all of them.
+_cs_runtime_cache_dir() {
+  local base probe
+  for base in /dev/shm "${TMPDIR:-/tmp}" /tmp; do
+    [[ -d "$base" ]] || continue
+    probe="${base}/.cs-probe.$$"
+    # -w can pass where the write still fails, so probe for real.
+    { : >"$probe"; } 2>/dev/null || continue
+    rm -f "$probe" 2>/dev/null
+    printf '%s' "$base"
+    return 0
+  done
+  return 1
+}
+
+# _cs_probe_read <name> - output of a host probe that core/build.func started at
+# load, once it has finished; fails when there is none or it failed, and the
+# caller runs the command itself. Polls a file, so it works inside $( ) too.
+_cs_probe_read() {
+  local rc
+  rc="$(_cs_probe_rc "$1")" && [[ "$rc" == "0" ]] || return 1
+  cat "${CS_PROBE_DIR}/$1.out"
+}
+
+# _cs_probe_rc <name> - a finished probe's exit code, for checks that answer
+# with one; fails when there is no such probe
+_cs_probe_rc() {
+  local dir="${CS_PROBE_DIR:-}" n=0
+  [[ -n "$dir" && -f "${dir}/$1.out" ]] || return 1
+  while [[ ! -f "${dir}/$1.rc" ]]; do
+    ((n++ < 1200)) || return 1
+    sleep 0.05
+  done
+  cat "${dir}/$1.rc"
+}
+
+# _cs_probe_drop <name>... - forget probes whose answer a change made stale
+_cs_probe_drop() {
+  local name
+  for name in "$@"; do
+    rm -f "${CS_PROBE_DIR:-/nonexistent}/${name}.out" "${CS_PROBE_DIR:-/nonexistent}/${name}.rc" 2>/dev/null
+  done
+  return 0
+}
+
+_cs_pveversion_out() {
+  _cs_probe_read pveversion || pveversion 2>/dev/null
+}
+
+_pve_version() {
+  [[ -n "${PVEVERSION:-}" ]] && { printf '%s' "$PVEVERSION"; return 0; }
+  local dir cache
+  dir="$(_cs_runtime_cache_dir)" || {
+    _cs_pveversion_out | awk -F'/' '{print $2}' | awk -F'-' '{print $1}'
+    return 0
+  }
+  cache="${dir}/cs-pveversion.$$"
+  [[ -s "$cache" ]] ||
+    _cs_pveversion_out | awk -F'/' '{print $2}' | awk -F'-' '{print $1}' >"$cache"
+  cat "$cache" 2>/dev/null
+}
+
+# PVEVERSION carries the product name on Incus ("Incus 7.3") because telemetry
+# reports it verbatim as pve_version. A fixed "PVE Version" prefix therefore
+# printed "PVE Version Incus 7.3" on Incus hosts.
+_cs_host_version_line() {
+  local v="${PVEVERSION:-}"
+  [[ -z "$v" ]] && command -v pveversion >/dev/null 2>&1 && v="$(_pve_version)"
+  v="${v:-unknown}"
+  if [[ "$v" == Incus* ]]; then
+    v="${v#Incus}"
+    v="${v# }"
+    printf 'Incus Version %s' "${v:-unknown}"
+  else
+    printf 'PVE Version %s' "$v"
+  fi
+}
+
+# "<what> <kind>: owner/repo@ref" for a raw base url. The kind is the part worth
+# reading: branch for the official repo on another ref, fork for somebody else's
+# copy, source when the host is not one we can take apart.
+_cs_ref_line() {
+  local what="$1" url="${2%/}" official="$3" rest owner repo ref kind
+  rest="${url#*://}"
+  case "$rest" in
+  raw.githubusercontent.com/*) rest="${rest#raw.githubusercontent.com/}" ;;
+  git.community-scripts.org/*) rest="${rest#git.community-scripts.org/}" ;;
+  *)
+    printf '%s source: %s' "$what" "$url"
+    return 0
+    ;;
+  esac
+
+  # read gives the remainder to the last name, so a ref with slashes survives:
+  # copilot/revert-aurral-to-node22 is one ref, not two path segments.
+  IFS=/ read -r owner repo ref <<<"$rest"
+  if [[ -z "$owner" || -z "$repo" || -z "$ref" ]]; then
+    printf '%s source: %s' "$what" "$url"
+    return 0
+  fi
+
+  kind=fork
+  case " $official " in
+  *" $owner/$repo "*) kind=branch ;;
+  esac
+  printf '%s %s: %s/%s@%s' "$what" "$kind" "$owner" "$repo" "$ref"
+}
+
+# Which engine this run is using, when it is not the default one. Prints nothing
+# otherwise, so the header only grows a line when there is something to say.
+_cs_engine_ref_line() {
+  local url="${COMMUNITY_SCRIPTS_CORE_URL:-}"
+  # The literal fallback matters: build.func exports COMMUNITY_SCRIPTS_CORE_URL
+  # but not _CS_CORE_DEFAULT_URL, so a child process sees the url with nothing
+  # to compare it against and every ordinary run looks like an override.
+  local default="${_CS_CORE_DEFAULT_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}"
+  url="${url%/}"
+  [[ -n "$url" && "$url" != "${default%/}" ]] || return 0
+  _cs_ref_line Engine "$url" "community-scripts/core"
+}
+
+# The same for the scripts, which is the other half of "what am I running" and
+# the one people override more often.
+_cs_scripts_ref_line() {
+  local url="${COMMUNITY_SCRIPTS_URL:-}" d
+  url="${url%/}"
+  [[ -n "$url" ]] || return 0
+
+  # Both official mains count as default, not just one literal: _CS_DEFAULT_URL
+  # is not exported either, and DevScripts scripts pin their own. ProxmoxVED is
+  # the name DevScripts had before.
+  for d in "${_CS_DEFAULT_URL:-}" \
+    https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local \
+    https://raw.githubusercontent.com/community-scripts/DevScripts/main \
+    https://raw.githubusercontent.com/community-scripts/ProxmoxVED/main; do
+    [[ -n "$d" && "$url" == "${d%/}" ]] && return 0
+  done
+
+  _cs_ref_line Scripts "$url" \
+    "community-scripts/ProxmoxVE community-scripts/DevScripts community-scripts/ProxmoxVED"
+}
+
+_pveam_available() {
+  local dir cache
+  dir="$(_cs_runtime_cache_dir)" || {
+    _cs_probe_read pveam || pveam available -section system 2>/dev/null
+    return 0
+  }
+  cache="${dir}/cs-pveam.$$"
+  [[ -s "$cache" ]] || { _cs_probe_read pveam || pveam available -section system 2>/dev/null; } >"$cache"
+  cat "$cache" 2>/dev/null
+}
+
+# `pveam update` exists so the next read sees something new, so it drops the
+# cache. Every update site goes through here for that reason.
+_pveam_update() {
+  local dir
+  dir="$(_cs_runtime_cache_dir)" && rm -f "${dir}/cs-pveam.$$"
+  _cs_probe_drop pveam
+  if command -v timeout &>/dev/null; then
+    timeout 30 pveam update >/dev/null 2>&1 || return 1
+  else
+    pveam update >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+pve_check() {
+  local PVE_VER
+  if ! on_pve_host; then
+    msg_error "${APP:-This script} must be run on the Proxmox VE host."
+    exit 232
+  fi
+  pmxcfs_check
+  PVE_VER="$(_pve_version)"
+
+  # Check for Proxmox VE 8.x: allow 8.0–8.9
+  if [[ "$PVE_VER" =~ ^8\.([0-9]+) ]]; then
+    local MINOR="${BASH_REMATCH[1]}"
+    if ((MINOR < 0 || MINOR > 9)); then
+      msg_error "This version of Proxmox VE is not supported."
+      msg_error "Supported: Proxmox VE version 8.0 – 8.9"
+      exit 1
+    fi
+    return 0
+  fi
+
+  # Check for Proxmox VE 9.x: allow 9.0–9.2
+  if [[ "$PVE_VER" =~ ^9\.([0-9]+) ]]; then
+    local MINOR="${BASH_REMATCH[1]}"
+    if ((MINOR < 0 || MINOR > 2)); then
+      msg_error "This version of Proxmox VE is not yet supported."
+      msg_error "Supported: Proxmox VE version 9.0 – 9.2"
+      exit 1
+    fi
+    return 0
+  fi
+
+  # All other unsupported versions
+  msg_error "This version of Proxmox VE is not supported."
+  msg_error "Supported versions: Proxmox VE 8.0 – 8.9 or 9.0 – 9.2"
+  exit 1
+}
+
+# ------------------------------------------------------------------------------
+# pmxcfs_check()
+#
+# - Every pct, qm and pvesm call needs the cluster filesystem at /etc/pve.
+#   Without it a run went through the whole settings menu and failed at the
+#   storage validation, filed as an unsupported storage type (54 runs a week)
+# - Offers to restart pve-cluster when the filesystem is not mounted, and
+#   names quorum when a cluster node has /etc/pve read-only
+# ------------------------------------------------------------------------------
+pmxcfs_check() {
+  if ! mountpoint -q /etc/pve 2>/dev/null; then
+    msg_error "The Proxmox cluster filesystem is not mounted at /etc/pve (pve-cluster: $(systemctl is-active pve-cluster 2>/dev/null || echo unknown))."
+    if [[ "${PHS_SILENT:-0}" != "1" && -t 0 ]] && command -v whiptail &>/dev/null &&
+      whiptail --backtitle "Proxmox VE Helper Scripts" --title "/etc/pve not available" --yesno \
+        "The Proxmox cluster filesystem (pmxcfs) is not mounted at /etc/pve, so nothing can be created.\n\nRestart the pve-cluster service now?" 12 72; then
+      msg_info "Restarting pve-cluster"
+      if systemctl restart pve-cluster 2>/dev/null && sleep 2 && mountpoint -q /etc/pve 2>/dev/null; then
+        msg_ok "Restarted pve-cluster, /etc/pve is back"
+      else
+        msg_error "Restarting pve-cluster did not bring /etc/pve back."
+      fi
+    fi
+    if ! mountpoint -q /etc/pve 2>/dev/null; then
+      msg_custom "🔧" "${YW}" "Run: systemctl restart pve-cluster, and if that fails: journalctl -u pve-cluster -n 50"
+      exit 228
+    fi
+  fi
+
+  if [[ ! -r /etc/pve/storage.cfg ]]; then
+    msg_error "/etc/pve is mounted, but /etc/pve/storage.cfg is missing."
+    msg_custom "🔧" "${YW}" "The cluster configuration looks damaged. Check: pvecm status and journalctl -u pve-cluster -n 50"
+    exit 228
+  fi
+
+  if [[ -f /etc/pve/corosync.conf ]] && ! { _cs_probe_read pvecm || pvecm status 2>/dev/null; } | grep -qE '^Quorate:[[:space:]]+Yes'; then
+    msg_error "This cluster node has no quorum, so /etc/pve is read-only and nothing can be created."
+    msg_custom "🔧" "${YW}" "Bring enough cluster nodes online, then check: pvecm status"
+    exit 210
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# arch_check()
+#
+# - Validates system architecture is amd64/x86_64
+# - Exits with error message for unsupported architectures (e.g., ARM/PiMox)
+#
+# var_arm64 has three states:
+#   yes     - known to work, proceed silently
+#   no      - known to be broken (no arm64 artifact, x86-only dependency), abort
+#   unknown - never verified on arm64 (default). Explain the situation and let
+#             the user decide, since "no artifact exists" and "nobody tried"
+#             are very different things and only the latter is worth attempting.
+# ------------------------------------------------------------------------------
+arch_check() {
+  local arch
+  arch="$(_cs_host_arch)"
+  case "$arch" in
+  x86_64) arch="amd64" ;;
+  aarch64) arch="arm64" ;;
+  esac
+  if [[ "$arch" != "amd64" && "$arch" != "arm64" ]]; then
+    msg_error "This script requires amd64 or arm64 (detected: $arch)."
+    sleep 2
+    exit 106
+  fi
+  [[ "$arch" != "arm64" ]] && return 0
+
+  case "${var_arm64:-unknown}" in
+  yes)
+    return 0
+    ;;
+  no)
+    msg_error "This script does not support arm64."
+    sleep 2
+    exit 106
+    ;;
+  *)
+    msg_warn "This script has not been verified on arm64."
+    echo -e "${TAB}It may work, or it may fail on an architecture-specific dependency."
+    echo -e "${TAB}If you try it, please report the outcome - success or failure:"
+    echo -e "${TAB}${BGN}https://github.com/community-scripts/DevScripts/issues${CL}"
+    echo ""
+    local arm64_src
+    if ! arm64_src="$(_cs_stdin_source)"; then
+      msg_error "Not running interactively - refusing to guess on arm64. Set var_arm64=yes to override."
+      sleep 2
+      exit 106
+    fi
+    read -r -p "${TAB}Continue anyway? (y/N): " arm64_prompt <"$arm64_src"
+    if [[ "${arm64_prompt,,}" =~ ^(y|yes)$ ]]; then
+      msg_ok "Continuing on arm64 - thanks for testing"
+      return 0
+    fi
+    msg_error "Aborted on arm64."
+    sleep 2
+    exit 106
+    ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# ssh_check()
+#
+# - Detects if script is running over SSH connection
+# - Warns user for external SSH connections (recommends Proxmox shell)
+# - Skips warning for local/same-subnet connections
+# - Does not abort execution, only warns
+# ------------------------------------------------------------------------------
+ssh_check() {
+  if [ -n "$SSH_CLIENT" ]; then
+    local client_ip=$(awk '{print $1}' <<<"$SSH_CLIENT")
+    local host_ip=$(hostname -I | awk '{print $1}')
+
+    # Check if connection is local (Proxmox WebUI or same machine)
+    # - localhost (127.0.0.1, ::1)
+    # - same IP as host
+    # - local network range (10.x, 172.16-31.x, 192.168.x)
+    if [[ "$client_ip" == "127.0.0.1" || "$client_ip" == "::1" || "$client_ip" == "$host_ip" ]]; then
+      return
+    fi
+
+    # Check if client is in same local network (optional, safer approach)
+    local host_subnet=$(echo "$host_ip" | cut -d. -f1-3)
+    local client_subnet=$(echo "$client_ip" | cut -d. -f1-3)
+    if [[ "$host_subnet" == "$client_subnet" ]]; then
+      return
+    fi
+
+    # Only warn for truly external connections
+    msg_warn "Running via external SSH (client: $client_ip)."
+    msg_warn "For better stability, consider using the Proxmox Shell (Console) instead."
+  fi
+}
+
+# ==============================================================================
+# SECTION 3: EXECUTION HELPERS
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# get_active_logfile()
+#
+# - Returns the appropriate log file based on execution context
+# - _HOST_LOGFILE: Override for host context (keeps host logging on BUILD_LOG
+#   even after INSTALL_LOG is exported for the container)
+# - INSTALL_LOG: Container operations (application installation)
+# - BUILD_LOG: Host operations (container creation)
+
+# - Fallback to BUILD_LOG if neither is set
+# ------------------------------------------------------------------------------
+get_active_logfile() {
+  # Host override: _HOST_LOGFILE is set (not exported) in build.func to keep
+  # host-side logging in BUILD_LOG after INSTALL_LOG is exported for the container.
+  # Without this, all host msg_info/msg_ok/msg_error would write to
+  # /root/.install-SESSION.log (a container path) instead of BUILD_LOG.
+  if [[ -n "${_HOST_LOGFILE:-}" ]]; then
+    echo "$_HOST_LOGFILE"
+  elif [[ -n "${INSTALL_LOG:-}" ]]; then
+    echo "$INSTALL_LOG"
+  elif [[ -n "${BUILD_LOG:-}" ]]; then
+    echo "$BUILD_LOG"
+  else
+    # No build log (the host tools): one file for the run, named at load. A
+    # name taken per call made a new file every second, so a failure's step
+    # and output were never in the log telemetry reads.
+    echo "${_CS_RUN_LOG:-/tmp/build-$(date +%Y%m%d_%H%M%S).log}"
+  fi
+}
+
+_CS_RUN_LOG="${_CS_RUN_LOG:-/tmp/build-$(date +%Y%m%d_%H%M%S).log}"
+
+# Legacy compatibility: SILENT_LOGFILE points to active log
+SILENT_LOGFILE="$(get_active_logfile)"
+
+# ------------------------------------------------------------------------------
+# strip_ansi()
+#
+# - Removes ANSI escape sequences from input text
+# - Used to clean colored output for log files
+# - Handles both piped input and arguments
+# ------------------------------------------------------------------------------
+strip_ansi() {
+  if [[ $# -gt 0 ]]; then
+    echo -e "$*" | sed 's/\x1b\[[0-9;]*m//g; s/\x1b\[[0-9;]*[a-zA-Z]//g'
+  else
+    sed 's/\x1b\[[0-9;]*m//g; s/\x1b\[[0-9;]*[a-zA-Z]//g'
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# log_msg()
+#
+# - Writes message to active log file without ANSI codes
+# - Adds timestamp prefix for log correlation
+# - Creates log file if it doesn't exist
+# - Arguments: message text (can include ANSI codes, will be stripped)
+# ------------------------------------------------------------------------------
+log_msg() {
+  local msg="$*"
+  local logfile
+  logfile="$(get_active_logfile)"
+
+  [[ -z "$msg" ]] && return 0
+  [[ -z "$logfile" ]] && return 0
+
+  # Ensure log directory exists
+  mkdir -p "$(dirname "$logfile")" 2>/dev/null || true
+
+  # Strip ANSI codes and write with timestamp
+  local clean_msg
+  clean_msg=$(strip_ansi "$msg")
+  # A log that cannot be written (full disk, removed directory) must not end the run.
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $clean_msg" >>"$logfile" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# log_section()
+#
+# - Writes a section header to the log file
+# - Used for separating different phases of installation
+# - Arguments: section name
+# ------------------------------------------------------------------------------
+log_section() {
+  local section="$1"
+  local logfile
+  logfile="$(get_active_logfile)"
+
+  [[ -z "$logfile" ]] && return 0
+  mkdir -p "$(dirname "$logfile")" 2>/dev/null || true
+
+  {
+    echo ""
+    echo "================================================================================"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $section"
+    echo "================================================================================"
+  } >>"$logfile" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# silent()
+#
+# - Executes command with output redirected to active log file
+# - On error: displays the FAILING COMMAND'S OWN output (not just the last 20
+#   log lines) and exits with original exit code
+# - Records the log byte offset before running so the exact output segment of
+#   the failing command can be extracted and written to "<logfile>.errinfo"
+#   for telemetry (the host builds the error trace from this file)
+# - Temporarily disables error trap to capture exit code correctly
+# ------------------------------------------------------------------------------
+# After a hangup the shell's stdout and stderr still point at the terminal that
+# is gone, and every write to it fails. The trap redirects them to the log, but
+# bash saves and restores fd 1 and 2 around a redirected call to a shell
+# function -- silent() makes exactly such a call -- so the redirect is undone
+# the moment that call returns. Re-apply it where no redirection is in effect.
+#
+# The flag is exported, so a script started after the hangup gets here too. A
+# pipe or a file on stdin is input its caller handed over -- the "y" in
+# `bash -c "$(curl ...)" <<<"y"` -- and stays; only a terminal is swapped out.
+_cs_reattach_output() {
+  [[ "${_CS_HANGUP:-}" == "1" ]] || return 0
+  local log="${_CS_HANGUP_LOG:-}"
+  [[ -n "$log" ]] || log="$(get_active_logfile)"
+  [[ -n "$log" ]] || return 0
+  if [[ -p /dev/stdin || -f /dev/stdin ]]; then
+    exec >>"$log" 2>&1
+  else
+    exec </dev/null >>"$log" 2>&1
+  fi
+}
+
+# A closed console sends SIGHUP to every process in the foreground group, and a
+# program that does not handle it dies. Run the long ones through here: the
+# subshell sets the signal to ignore, which exec carries into the program, so
+# it finishes even though the terminal is gone.
+_cs_shield_hangup() {
+  # Inside $(...) the engine's trap is already reset, so that subshell died of the
+  # hangup and returned 129 for a command that finished (update-apps: "Backup failed").
+  local _sig=""
+  if [[ "$BASHPID" != "$$" && -r "/proc/$BASHPID/status" ]]; then
+    while read -r _sig; do [[ "$_sig" == SigCgt:* ]] && break; done <"/proc/$BASHPID/status"
+    ((16#${_sig##*[[:space:]]} & 1)) || trap '' HUP
+  fi
+  (
+    trap '' HUP
+    # apt restores the terminal it was given and exits 100 when it is gone.
+    [[ -t 0 ]] && exec </dev/null
+    [[ "$(type -t "$1")" == function ]] && { "$@"; exit; }
+    exec "$@"
+  )
+}
+
+# A silent() failure its step handled is history once a step starts or ends.
+_cs_drop_silent_record() {
+  [[ -n "${_SILENT_FAILED_LOG:-}" ]] && rm -f "${_SILENT_FAILED_LOG}.errinfo" 2>/dev/null
+  unset _SILENT_FAILED_RC _SILENT_FAILED_CMD _SILENT_FAILED_LINE _SILENT_FAILED_LOG
+}
+
+silent() {
+  _cs_reattach_output
+  # A failure the caller handled (a retry loop) must not be reported for a later, unrelated error.
+  unset _SILENT_FAILED_RC _SILENT_FAILED_CMD _SILENT_FAILED_LINE _SILENT_FAILED_LOG
+  local cmd="$*"
+  # apt warns about its CLI whenever stdout is not a terminal, and here it never is.
+  if [[ "${1:-}" == "apt" ]]; then
+    set -- apt -o Apt::Cmd::Disable-Script-Warning=true "${@:2}"
+  fi
+  local caller_line="${BASH_LINENO[0]:-unknown}"
+  local logfile="$(get_active_logfile)"
+  local errinfo="${logfile}.errinfo"
+
+  # Save current error handling state before disabling.
+  # This prevents re-enabling error handling when the caller intentionally
+  # disabled it.
+  local _restore_errexit=false
+  [[ "$-" == *e* ]] && _restore_errexit=true
+  # A script run through pct exec has no error_handler, so re-arming it turned
+  # the next failure into "error_handler: command not found" (exit 127).
+  local _err_trap
+  _err_trap="$(trap -p ERR)"
+
+  set +Eeuo pipefail
+  trap - ERR
+
+  # Byte offset BEFORE the command runs - everything the log grows by is
+  # exactly this command's output.
+  local start_bytes=0
+  [[ -f "$logfile" ]] && start_bytes=$(stat -c%s "$logfile" 2>/dev/null || echo 0)
+  [[ ! "$start_bytes" =~ ^[0-9]+$ ]] && start_bytes=0
+
+  # A closed console sends SIGHUP to everything in the foreground. A function
+  # stays in this shell, which handles the signal itself; an external program
+  # inherits "ignore" and keeps running.
+  local rc run=("$@")
+  case "$(type -t "$1" 2>/dev/null)" in
+  function | builtin | "") ;;
+  *) run=(_cs_shield_hangup "$@") ;;
+  esac
+  if [[ "${VERBOSE:-no}" == "yes" ]]; then
+    # Not a pipe: the command must stay in this shell so functions keep their side effects.
+    "${run[@]}" > >(tee -a "$logfile") 2>&1
+    rc=$?
+    local tee_pid=$! waited
+    for ((waited = 0; waited < 30; waited++)); do
+      kill -0 "$tee_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+  else
+    "${run[@]}" >>"$logfile" 2>&1
+    rc=$?
+  fi
+  # A hangup during the call moved the output inside its redirection, which
+  # bash undid on return.
+  _cs_reattach_output
+
+  # Restore error handling ONLY if it was active before this call.
+  if $_restore_errexit; then
+    set -Eeuo pipefail
+    if [[ -n "$_err_trap" ]]; then
+      eval "$_err_trap"
+    elif declare -F error_handler >/dev/null; then
+      trap 'error_handler' ERR
+    fi
+  fi
+
+  if [[ $rc -ne 0 ]]; then
+    export _SILENT_FAILED_RC="$rc"
+    export _SILENT_FAILED_CMD="$cmd"
+    export _SILENT_FAILED_LINE="$caller_line"
+    export _SILENT_FAILED_LOG="$logfile"
+
+    {
+      echo "EXIT_CODE=${rc}"
+      echo "LINE=${caller_line}"
+      echo "COMMAND=$(printf '%s' "$cmd" | tr '\n' ' ' | head -c 300)"
+      echo "FUNCTION=${FUNCNAME[1]:-}"
+      echo "STEP=${CS_STEP:-}"
+      echo "--- OUTPUT ---"
+      if [[ -s "$logfile" ]]; then
+        if declare -f _tm_clean_log >/dev/null 2>&1; then
+          tail -c +"$((start_bytes + 1))" "$logfile" 2>/dev/null | _tm_clean_log | cut -c1-1000 | tail -n 60 | tail -c 10240
+        else
+          tail -c +"$((start_bytes + 1))" "$logfile" 2>/dev/null | sed 's/\r$//; s/\x1b\[[0-9;]*[a-zA-Z]//g' | cut -c1-1000 | tail -n 200 | tail -c 32768
+        fi
+      fi
+    } >"$errinfo" 2>/dev/null || true
+
+    return "$rc"
+  fi
+
+  unset _SILENT_FAILED_RC _SILENT_FAILED_CMD _SILENT_FAILED_LINE _SILENT_FAILED_LOG 2>/dev/null || true
+  rm -f "$errinfo" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# spinner()
+#
+# - Displays animated spinner with rotating characters (⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+# - Shows SPINNER_MSG alongside animation
+# - Runs in infinite loop until killed by stop_spinner()
+# - Uses color_spinner() colors for output
+# ------------------------------------------------------------------------------
+_msg_fit() {
+  local msg="$1" reserved="${2:-4}" size cols max
+  size="$(stty size 2>/dev/null </dev/tty)" || size=""
+  cols="${size##* }"
+  [[ "$cols" =~ ^[1-9][0-9]*$ ]] || cols="${COLUMNS:-}"
+  if [[ ! "$cols" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$msg"
+    return 0
+  fi
+  max=$((cols - reserved))
+  ((max < 10)) && max=10
+  if ((${#msg} > max)); then
+    printf '%s…' "${msg:0:max-1}"
+  else
+    printf '%s' "$msg"
+  fi
+}
+
+spinner() {
+  # Reset bash's command hash table — package upgrades (dnf/pacman) may have
+  # moved /usr/bin <-> /usr/sbin during /usr-merge, leaving the parent shell
+  # with stale cached paths that get inherited by this background subshell.
+  hash -r 2>/dev/null || true
+  local chars=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  local msg
+  msg="$(_msg_fit "${SPINNER_MSG:-Processing...}" 4)"
+  local i=0
+  while true; do
+    local index=$((i++ % ${#chars[@]}))
+    printf "\r\033[2K%s %b" "${CS_YWB}${chars[$index]}${CS_CL}" "${CS_YWB}${msg}${CS_CL}"
+    sleep 0.1 2>/dev/null || command sleep 0.1 2>/dev/null || break
+  done
+}
+
+# ------------------------------------------------------------------------------
+# clear_line()
+#
+# - Clears current terminal line using tput or ANSI escape codes
+# - Moves cursor to beginning of line (carriage return)
+# - Erases from cursor to end of line
+# - Fallback to ANSI codes if tput not available
+# ------------------------------------------------------------------------------
+clear_line() {
+  tput cr 2>/dev/null || echo -en "\r"
+  tput el 2>/dev/null || echo -en "\033[K"
+}
+
+# ------------------------------------------------------------------------------
+# stop_spinner()
+#
+# - Stops running spinner process by PID
+# - Reads PID from SPINNER_PID variable or /tmp/.spinner.pid file
+# - Attempts graceful kill, then forced kill if needed
+# - Cleans up temp file and resets terminal state
+# - Unsets SPINNER_PID and SPINNER_MSG variables
+# ------------------------------------------------------------------------------
+stop_spinner() {
+  local pid="${SPINNER_PID:-}"
+  [[ -z "$pid" && -f /tmp/.spinner.pid ]] && pid=$(</tmp/.spinner.pid)
+
+  if [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]]; then
+    if kill "$pid" 2>/dev/null; then
+      sleep 0.05
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+    rm -f /tmp/.spinner.pid
+  fi
+
+  unset SPINNER_PID SPINNER_MSG
+  stty sane 2>/dev/null || true
+}
+
+# A helper opening its own block (setup_uv, setup_nodejs) stopped the outer
+# one's spinner and nothing brought it back.
+declare -ga _MSG_BLOCKS=()
+
+_msg_block_resume() {
+  ((${#_MSG_BLOCKS[@]})) || return 0
+  SPINNER_MSG="${_MSG_BLOCKS[-1]}"
+
+  if is_verbose_mode || is_alpine; then
+    printf "\r\e[2K%s %b" "${TAB}⏳${TAB}" "${YW}${SPINNER_MSG}${CL}" >&2
+    return 0
+  fi
+
+  color_spinner
+  spinner &
+  SPINNER_PID=$!
+  { echo "$SPINNER_PID" >/tmp/.spinner.pid; } 2>/dev/null || true
+  disown "$SPINNER_PID" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# _cs_os_family()
+#
+# Echoes debian, alpine, rhel, suse, arch, gentoo or unknown.
+#
+# Does not read OS_FAMILY or PKG_MANAGER: detect_os() sets those on the install
+# path only, and an update reaches update_script() without it.
+# ------------------------------------------------------------------------------
+_cs_os_family() {
+  if [[ -f /etc/alpine-release ]]; then
+    echo "alpine"
+    return 0
+  fi
+
+  local id="" id_like=""
+  if [[ -r /etc/os-release ]]; then
+    id="$(. /etc/os-release 2>/dev/null && echo "${ID:-}")"
+    id_like="$(. /etc/os-release 2>/dev/null && echo "${ID_LIKE:-}")"
+  fi
+
+  case "${id,,} ${id_like,,}" in
+  *alpine*) echo "alpine" ;;
+  *debian* | *ubuntu*) echo "debian" ;;
+  *rhel* | *fedora* | *centos*) echo "rhel" ;;
+  *suse*) echo "suse" ;;
+  *arch*) echo "arch" ;;
+  *gentoo*) echo "gentoo" ;;
+  *) echo "unknown" ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# _cs_run_os_section(kind)
+#
+# Resolves the OS family to a function name and calls it. An explicit table, not
+# a computed "${kind}_${family}", so deb_based can say it covers Ubuntu too.
+# ------------------------------------------------------------------------------
+_cs_run_os_section() {
+  local kind="$1" family fn
+  family="$(_cs_os_family)"
+
+  case "$family" in
+  debian) fn="${kind}_deb_based" ;;
+  alpine) fn="${kind}_alpine" ;;
+  rhel) fn="${kind}_rhel_based" ;;
+  suse) fn="${kind}_suse_based" ;;
+  arch) fn="${kind}_arch_based" ;;
+  gentoo) fn="${kind}_gentoo_based" ;;
+  *)
+    msg_error "Cannot determine the OS family of this system"
+    return 1
+    ;;
+  esac
+
+  # Defining the function is how a script declares support. Saying so beats a
+  # silent no-op that looks like success.
+  if ! declare -f "$fn" >/dev/null 2>&1; then
+    msg_error "${APP:-This script} does not support ${family}: ${fn}() is not defined"
+    return 1
+  fi
+
+  "$fn"
+}
+
+# ------------------------------------------------------------------------------
+# run_os_setup()
+#
+# Calls setup_deb_based, setup_alpine, setup_rhel_based and so on. Must appear
+# after those definitions.
+# ------------------------------------------------------------------------------
+run_os_setup() { _cs_run_os_section setup; }
+
+# ------------------------------------------------------------------------------
+# run_os_update()
+#
+# The same for a ct script's update path: update_deb_based, update_alpine. Call
+# it from update_script(). Dispatches on the running OS, never on var_os, which
+# says what to create and means nothing once the container exists.
+# ------------------------------------------------------------------------------
+run_os_update() { _cs_run_os_section update; }
+
+# ==============================================================================
+# SECTION 4: MESSAGE OUTPUT
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# _dev_step_start() / _dev_step_end() (fallback)
+#
+# - Canonical versions live in dev-mode.func, which msg_info and msg_ok below
+#   call unconditionally
+# - These no-ops cover every context that loads core.func on its own: the
+#   container, and the standalone tools/ and vm/ scripts. Without them the first
+#   msg_info dies with "command not found"
+# - dev-mode.func defines unconditionally, so real timing wins either order
+# ------------------------------------------------------------------------------
+if ! declare -f _dev_step_start &>/dev/null; then
+  _dev_step_start() { :; }
+fi
+if ! declare -f _dev_step_end &>/dev/null; then
+  _dev_step_end() { :; }
+fi
+
+# ------------------------------------------------------------------------------
+# msg_info()
+#
+# - Displays informational message with spinner animation
+# - Shows each unique message only once (tracked via MSG_INFO_SHOWN)
+# - In verbose/Alpine mode: shows hourglass icon instead of spinner
+# - Stops any existing spinner before starting new one
+# - Backgrounds spinner process and stores PID for later cleanup
+# ------------------------------------------------------------------------------
+msg_info() {
+  _cs_reattach_output
+  local msg="$1"
+  [[ -z "$msg" ]] && return
+  # Read by the error handler and telemetry: which step failed, and what it said.
+  CS_STEP="$(strip_ansi "$msg")"
+  CS_ERROR_MSG=""
+  _cs_drop_silent_record
+
+  if ! declare -p MSG_INFO_SHOWN &>/dev/null || ! declare -A MSG_INFO_SHOWN &>/dev/null; then
+    declare -gA MSG_INFO_SHOWN=()
+  fi
+  local sanitized_key
+  sanitized_key=$(printf '%s' "$msg" | sed 's/\x1b\[[0-9;]*m//g; s/[^a-zA-Z0-9_]/_/g')
+  if [[ -n "${MSG_INFO_SHOWN["$sanitized_key"]+x}" ]]; then
+    _MSG_BLOCKS+=("$msg")
+    return
+  fi
+  MSG_INFO_SHOWN["$sanitized_key"]=1
+
+  _dev_step_start "$msg"
+
+  # Log to file
+  log_msg "[INFO] $msg"
+
+  stop_spinner
+  SPINNER_MSG="$msg"
+  _MSG_BLOCKS+=("$msg")
+
+  if is_verbose_mode || is_alpine; then
+    local HOURGLASS="${TAB}⏳${TAB}"
+    printf "\r\e[2K%s %b" "$HOURGLASS" "${YW}${msg}${CL}" >&2
+
+    # Pause mode: Wait for Enter after each step
+    if [[ "${DEV_MODE_PAUSE:-false}" == "true" ]]; then
+      echo -en "\n${YWB}[PAUSE]${CL} Press Enter to continue..." >&2
+      read -r </dev/tty
+    fi
+    return
+  fi
+
+  color_spinner
+  spinner &
+  SPINNER_PID=$!
+  { echo "$SPINNER_PID" >/tmp/.spinner.pid; } 2>/dev/null || true
+  disown "$SPINNER_PID" 2>/dev/null || true
+
+  # Pause mode: Stop spinner and wait
+  if [[ "${DEV_MODE_PAUSE:-false}" == "true" ]]; then
+    stop_spinner
+    echo -en "\n${YWB}[PAUSE]${CL} Press Enter to continue..." >&2
+    read -r </dev/tty
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# msg_ok()
+#
+# - Displays success message with checkmark icon
+# - Stops spinner and clears line before output
+# - Removes message from MSG_INFO_SHOWN to allow re-display
+# - Uses green color for success indication
+# ------------------------------------------------------------------------------
+msg_ok() {
+  _cs_reattach_output
+  local msg="$1"
+  [[ -z "$msg" ]] && return
+  CS_STEP_DONE="$(strip_ansi "$msg")"
+  CS_STEP=""
+  CS_ERROR_MSG=""
+  _cs_drop_silent_record
+  stop_spinner
+  ((${#_MSG_BLOCKS[@]})) && unset '_MSG_BLOCKS[-1]'
+  clear_line
+  echo -e "$CM${GN}${msg}${CL}$(_dev_step_end "$msg")"
+  log_msg "[OK] $msg"
+  local sanitized_key
+  sanitized_key=$(printf '%s' "$msg" | sed 's/\x1b\[[0-9;]*m//g; s/[^a-zA-Z0-9_]/_/g')
+  unset 'MSG_INFO_SHOWN['"$sanitized_key"']' 2>/dev/null || true
+  _msg_block_resume
+}
+
+# ------------------------------------------------------------------------------
+# msg_error()
+#
+# - Displays error message with cross/X icon
+# - Stops spinner before output
+# - Uses red color for error indication
+# - Outputs to stderr
+# ------------------------------------------------------------------------------
+msg_error() {
+  _cs_reattach_output
+  stop_spinner
+  _MSG_BLOCKS=()
+  local msg="$1"
+  [[ -z "${CS_ERROR_MSG:-}" && -z "${_EH_REPORTING:-}" ]] && CS_ERROR_MSG="$(strip_ansi "$msg")"
+  echo -e "${BFR:-}${CROSS:-✖️}${RD}${msg}${CL}" >&2
+  log_msg "[ERROR] $msg"
+}
+
+# ------------------------------------------------------------------------------
+# msg_warn()
+#
+# - Displays warning message with info/lightbulb icon
+# - Stops spinner before output
+# - Uses bright yellow color for warning indication
+# - Outputs to stderr
+# ------------------------------------------------------------------------------
+msg_warn() {
+  _cs_reattach_output
+  stop_spinner
+  _MSG_BLOCKS=()
+  local msg="$1"
+  echo -e "${BFR:-}${INFO:-ℹ️} ${YWB}${msg}${CL}" >&2
+  log_msg "[WARN] $msg"
+}
+
+# ------------------------------------------------------------------------------
+# msg_custom()
+#
+# - Displays custom message with user-defined symbol and color
+# - Arguments: symbol, color code, message text
+# - Stops spinner before output
+# - Useful for specialized status messages
+# ------------------------------------------------------------------------------
+msg_custom() {
+  _cs_reattach_output
+  local symbol="${1:-"[*]"}"
+  local color="${2:-"\e[36m"}"
+  local msg="${3:-}"
+  [[ -z "$msg" ]] && return
+  stop_spinner
+  # Align with CM/CROSS: TAB + icon + TAB + message (not a single leading space).
+  echo -e "${BFR:-}${TAB:-  }${symbol}${TAB:-  }${color}${msg}${CL:-\e[0m}"
+  log_msg "$msg"
+  _msg_block_resume
+}
+
+# ------------------------------------------------------------------------------
+# msg_debug()
+#
+# - Displays debug message with timestamp when var_full_verbose=1
+# - Automatically enables var_verbose if not already set
+# - Shows date/time prefix for log correlation
+# - Uses bright yellow color for debug output
+# ------------------------------------------------------------------------------
+msg_debug() {
+  if [[ "${var_full_verbose:-0}" == "1" ]]; then
+    [[ "${var_verbose:-0}" != "1" ]] && var_verbose=1
+    echo -e "${YWB}[$(date '+%F %T')] [DEBUG]${CL} $*"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# msg_dev()
+#
+# - Display development mode messages with 🔧 icon
+# - Only shown when dev_mode is active
+# - Useful for debugging and development-specific output
+# - Format: [DEV] message with distinct formatting
+# - Usage: msg_dev "Container ready for debugging"
+# ------------------------------------------------------------------------------
+msg_dev() {
+  if [[ -n "${dev_mode:-}" ]]; then
+    echo -e "${SEARCH}${BOLD}${DGN}🔧 [DEV]${CL} $*"
+  fi
+}
+#
+# - Displays error message and immediately terminates script
+# - Sends SIGINT to current process to trigger error handler
+# - Use for unrecoverable errors that require immediate exit
+# ------------------------------------------------------------------------------
+fatal() {
+  msg_error "$1"
+  kill -INT $$
+}
+
+# ==============================================================================
+# SECTION 5: UTILITY FUNCTIONS
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# exit_script()
+#
+# - Called when user cancels an action
+# - Clears screen and displays exit message
+# - Exits with default exit code
+# ------------------------------------------------------------------------------
+exit_script() {
+  _cs_clear
+  echo -e "\n${CROSS}${RD}User exited script${CL}\n"
+  exit
+}
+
+# ------------------------------------------------------------------------------
+# get_header()
+#
+# - Downloads and caches application header ASCII art
+# - Falls back to local cache if already downloaded
+# - Determines app type (ct/vm) from APP_TYPE variable
+# - Returns header content or empty string on failure
+# ------------------------------------------------------------------------------
+# Drawn until the generator has produced a script's own banner (figlet slant,
+# like the generated ones); the app name follows in plain text.
+_CS_FALLBACK_HEADER='   ______                                      _ __           _____           _       __
+  / ____/___  ____ ___  ____ ___  __  ______  (_) /___  __   / ___/__________(_)___  / /______
+ / /   / __ \/ __ `__ \/ __ `__ \/ / / / __ \/ / __/ / / /   \__ \/ ___/ ___/ / __ \/ __/ ___/
+/ /___/ /_/ / / / / / / / / / / / /_/ / / / / / /_/ /_/ /   ___/ / /__/ /  / / /_/ / /_(__  )
+\____/\____/_/ /_/ /_/_/ /_/ /_/\__,_/_/ /_/_/\__/\__, /   /____/\___/_/  /_/ .___/\__/____/
+                                                 /____/                    /_/'
+
+get_header() {
+  # Slug must match what the generator writes: APP lowercased, spaces removed.
+  local app_name=$(echo "${APP,,}" | tr -d ' ')
+  local app_type=${APP_TYPE:-ct} # ct | addon | tools | vm
+
+  # Most banners are the same on both hosts and live flat under the type. A
+  # script that only exists on one platform -- host tools today, Incus VMs or
+  # host-touching add-ons tomorrow -- gets a platform subfolder, which wins when
+  # present. Trying it first and falling back keeps both cases in one lookup.
+  local platform="pve"
+  declare -f detect_lxc_platform >/dev/null 2>&1 && platform="$(detect_lxc_platform)"
+  [[ "$platform" == incus* ]] && platform="incus" || platform="pve"
+  # Headers live in the ENGINE repo, one folder per APP_TYPE. They are generated
+  # from the script repos, so a script repo carries none of its own.
+  local core_url="${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}"
+  local rel
+  # Generic first. The platform folders hold five headers between them, all for
+  # apps with no generic one, so the two sets are disjoint and the order cannot
+  # change which header wins — only how often the first lookup 404s. Platform
+  # first made that 673 of 673 ct runs.
+  for rel in "${app_type}/${app_name}" "${app_type}/${platform}/${app_name}"; do
+    # Local core checkout wins, so a fork or branch renders its own headers.
+    if [[ -n "${COMMUNITY_SCRIPTS_CORE_DIR:-}" && -s "${COMMUNITY_SCRIPTS_CORE_DIR}/headers/${rel}" ]]; then
+      cat "${COMMUNITY_SCRIPTS_CORE_DIR}/headers/${rel}" 2>/dev/null || true
+      return 0
+    fi
+
+    # Not the hardcoded /usr/local path: a non-root operator on an Incus host
+    # cannot create it, so the fetch below had nowhere to write and every
+    # banner silently vanished. community_scripts_dir() already falls back to
+    # ~/.config, which is where that run's logs were going anyway.
+    local cache_root
+    cache_root="$(declare -f community_scripts_dir >/dev/null 2>&1 && community_scripts_dir || echo /usr/local/community-scripts)"
+    local cached="${cache_root}/headers/${rel}"
+    if [[ -s "$cached" ]]; then
+      cat "$cached" 2>/dev/null || true
+      return 0
+    fi
+
+    if ! mkdir -p "$(dirname "$cached")" 2>/dev/null; then
+      # Nothing writable anywhere: still draw the banner, just uncached.
+      curl -fsSL --connect-timeout 5 --max-time 15 "${core_url}/headers/${rel}" 2>/dev/null && return 0
+      continue
+    fi
+    # No retry here, unlike every other engine fetch: this one only decides
+    # whether an ASCII banner appears, and the loop has several candidates to
+    # get through. It does need a bound, though — without one a black-holed
+    # network waits out the OS TCP timeout per candidate before drawing nothing.
+    if curl -fsSL --connect-timeout 5 --max-time 15 "${core_url}/headers/${rel}" -o "$cached" && [[ -s "$cached" ]]; then
+      cat "$cached" 2>/dev/null || true
+      return 0
+    fi
+    # Do not leave an empty file behind: it would satisfy the cache check above
+    # on every later run and permanently suppress the banner.
+    rm -f "$cached"
+  done
+
+  # A brand-new script has no header until the generator has run. Not an error
+  # -- header_info() simply prints nothing.
+  return 1
+}
+
+# ------------------------------------------------------------------------------
+# header_info()
+#
+# - Displays application header ASCII art at top of screen
+# - Clears screen before displaying header
+# - Detects terminal width for formatting
+# - Returns silently if header not available
+# ------------------------------------------------------------------------------
+header_info() {
+  local app_name=$(echo "${APP,,}" | tr -d ' ')
+  local header_content
+
+  header_content=$(get_header "$app_name") || header_content=""
+
+  _cs_clear
+  local term_width
+  term_width=$(tput cols 2>/dev/null || echo 120)
+
+  if [ -n "$header_content" ]; then
+    echo "$header_content"
+  else
+    echo "${_CS_FALLBACK_HEADER:-Community Scripts}"
+    echo "  ${APP:-}"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# ensure_tput()
+#
+# - Ensures tput command is available for terminal control
+# - Installs ncurses-bin on Debian/Ubuntu or ncurses on Alpine
+# - Required for clear_line() and terminal width detection
+# ------------------------------------------------------------------------------
+ensure_tput() {
+  if ! command -v tput >/dev/null 2>&1; then
+    if grep -qi 'alpine' /etc/os-release; then
+      apk add --no-cache ncurses >/dev/null 2>&1
+    elif command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq >/dev/null 2>&1 || true
+      apt-get install -y -qq ncurses-bin >/dev/null 2>&1
+    fi
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# reclaim_tty()
+#
+# - Reclaims the controlling terminal's foreground process group
+# - lxc-attach takes the terminal and does not hand it back, leaving us in a
+#   background process group. Reading from the terminal then returns EIO
+#   instead of blocking, because SIGTTIN is ignored during recovery - so the
+#   prompt fails before the user can answer and their keystroke leaks into the
+#   parent shell. Redirecting to /dev/tty does not help: the rule applies to
+#   the terminal, not to the file descriptor.
+# - pct exec/pull/enter use lxc-attach internally, so the terminal can be taken
+#   away again at any point. Call this immediately before each interactive
+#   read, not once after the install.
+# - SIGTTOU is ignored inside perl so tcsetpgrp() succeeds instead of stopping
+#   us. No-op when we already are in the foreground or there is no terminal.
+#   perl is a hard dependency of Proxmox VE.
+# ------------------------------------------------------------------------------
+reclaim_tty() {
+  command -v perl >/dev/null 2>&1 || return 0
+  [[ -e /dev/tty ]] || return 0
+
+  local pgid
+  pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ') || true
+
+  perl -e '
+    use POSIX;
+    $SIG{TTOU} = "IGNORE";
+    my $pgid = $ARGV[0] || POSIX::getpgrp();
+    open(my $t, "+<", "/dev/tty") or exit 1;
+    POSIX::tcsetpgrp(fileno($t), $pgid) or exit 1;
+  ' "${pgid:-0}" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# is_alpine()
+#
+# - Detects if running on Alpine Linux
+# - Checks var_os, PCT_OSTYPE, or /etc/os-release
+# - Returns 0 if Alpine, 1 otherwise
+# - Used to adjust behavior for Alpine-specific commands
+# ------------------------------------------------------------------------------
+is_alpine() {
+  local os_id="${var_os:-${PCT_OSTYPE:-}}"
+
+  if [[ -z "$os_id" && -f /etc/os-release ]]; then
+    os_id="$(
+      . /etc/os-release 2>/dev/null
+      echo "${ID:-}"
+    )"
+  fi
+
+  [[ "$os_id" == "alpine" ]]
+}
+
+# ------------------------------------------------------------------------------
+# configure_http_proxy()
+#
+# - Applies var_http_proxy / var_http_no_proxy inside the container
+# - Persists proxy env for login shells, systemd, and package managers
+# - Skips APT proxy config when APT Cacher-NG is active
+# ------------------------------------------------------------------------------
+configure_http_proxy() {
+  local proxy="${HTTP_PROXY:-${http_proxy:-${var_http_proxy:-}}}"
+  local noproxy="${HTTP_NO_PROXY:-${no_proxy:-${var_http_no_proxy:-}}}"
+  [[ -z "$proxy" ]] && return 0
+  [[ -z "$noproxy" ]] && noproxy="localhost,127.0.0.1,.local"
+
+  msg_info "Configuring HTTP proxy"
+  cat >/etc/profile.d/90-http-proxy.sh <<EOF
+export http_proxy="$proxy"
+export https_proxy="$proxy"
+export HTTP_PROXY="$proxy"
+export HTTPS_PROXY="$proxy"
+export no_proxy="$noproxy"
+export NO_PROXY="$noproxy"
+EOF
+  chmod 644 /etc/profile.d/90-http-proxy.sh
+
+  if ! grep -q '^http_proxy=' /etc/environment 2>/dev/null; then
+    cat >>/etc/environment <<EOF
+http_proxy=$proxy
+https_proxy=$proxy
+HTTP_PROXY=$proxy
+HTTPS_PROXY=$proxy
+no_proxy=$noproxy
+NO_PROXY=$noproxy
+EOF
+  fi
+
+  if [[ "${CACHER:-}" != "yes" && -d /etc/apt/apt.conf.d ]]; then
+    cat >/etc/apt/apt.conf.d/95http-proxy <<EOF
+Acquire::http::Proxy "$proxy";
+Acquire::https::Proxy "$proxy";
+EOF
+  fi
+
+  export http_proxy="$proxy" https_proxy="$proxy" HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy"
+  export no_proxy="$noproxy" NO_PROXY="$noproxy"
+  msg_ok "Configured HTTP proxy"
+}
+
+# ------------------------------------------------------------------------------
+# is_verbose_mode()
+#
+# - Determines if script should run in verbose mode
+# - Checks VERBOSE and var_verbose variables
+# - Also returns true if not running in TTY (pipe/redirect scenario)
+# - Used by msg_info() to decide between spinner and static output
+# ------------------------------------------------------------------------------
+is_verbose_mode() {
+  local verbose="${VERBOSE:-${var_verbose:-no}}"
+  [[ "$verbose" != "no" ]] && return 0
+  # A non-terminal stderr normally means an animation would be invisible. That
+  # is wrong inside a container: `incus exec` proxies the stream to the
+  # operator's terminal, so the frames do arrive. The host sets
+  # CS_ANIMATION_OK when a terminal is on the far end, and only then.
+  [[ ! -t 2 && "${CS_ANIMATION_OK:-0}" != "1" ]]
+}
+
+# ------------------------------------------------------------------------------
+# is_unattended()
+#
+# - Detects if script is running in unattended/non-interactive mode
+# - Checks MODE variable first (primary method)
+# - Falls back to legacy flags (PHS_SILENT, var_unattended)
+# - Returns 0 (true) if unattended, 1 (false) otherwise
+# - Used by prompt functions to auto-apply defaults
+#
+# Modes that are unattended:
+#   - default (1)      : Use script defaults, no prompts
+#   - mydefaults (3)   : Use user's default.vars, no prompts
+#   - appdefaults (4)  : Use app-specific defaults, no prompts
+#
+# Modes that are interactive:
+#   - advanced (2)     : Full wizard with all options
+#
+# Note: Even in advanced mode, install scripts run unattended because
+#       all values are already collected during the wizard phase.
+# ------------------------------------------------------------------------------
+is_unattended() {
+  # Primary: Check MODE variable (case-insensitive)
+  local mode="${MODE:-${mode:-}}"
+  mode="${mode,,}" # lowercase
+
+  case "$mode" in
+  default | 1)
+    return 0
+    ;;
+  mydefaults | userdefaults | 3)
+    return 0
+    ;;
+  appdefaults | 4)
+    return 0
+    ;;
+  advanced | 2)
+    # Advanced mode is interactive ONLY during wizard
+    # Inside container (install scripts), it should be unattended
+    # Check if we're inside a container (no pveversion command)
+    if ! command -v pveversion &>/dev/null; then
+      # We're inside the container - all values already collected
+      return 0
+    fi
+    # On host during wizard - interactive
+    return 1
+    ;;
+  esac
+
+  # Legacy fallbacks for compatibility
+  [[ "${PHS_SILENT:-0}" == "1" ]] && return 0
+  [[ "${var_unattended:-}" =~ ^(yes|true|1)$ ]] && return 0
+  [[ "${UNATTENDED:-}" =~ ^(yes|true|1)$ ]] && return 0
+
+  # No TTY available = unattended
+  [[ ! -t 0 ]] && return 0
+
+  # Default: interactive
+  return 1
+}
+
+# ------------------------------------------------------------------------------
+# show_missing_values_warning()
+#
+# - Displays a summary of required values that used fallback defaults
+# - Should be called at the end of install scripts
+# - Only shows warning if MISSING_REQUIRED_VALUES array has entries
+# - Provides clear guidance on what needs manual configuration
+#
+# Global:
+#   MISSING_REQUIRED_VALUES - Array of variable names that need configuration
+#
+# Example:
+#   # At end of install script:
+#   show_missing_values_warning
+# ------------------------------------------------------------------------------
+show_missing_values_warning() {
+  if [[ ${#MISSING_REQUIRED_VALUES[@]} -gt 0 ]]; then
+    echo ""
+    echo -e "${YW}╔════════════════════════════════════════════════════════════╗${CL}"
+    echo -e "${YW}║  ⚠️  MANUAL CONFIGURATION REQUIRED                          ║${CL}"
+    echo -e "${YW}╠════════════════════════════════════════════════════════════╣${CL}"
+    echo -e "${YW}║  The following values were not provided and need to be     ║${CL}"
+    echo -e "${YW}║  configured manually for the service to work properly:     ║${CL}"
+    echo -e "${YW}╟────────────────────────────────────────────────────────────╢${CL}"
+    for val in "${MISSING_REQUIRED_VALUES[@]}"; do
+      printf "${YW}║${CL}  • %-56s ${YW}║${CL}\n" "$val"
+    done
+    echo -e "${YW}╟────────────────────────────────────────────────────────────╢${CL}"
+    echo -e "${YW}║  Check the service configuration files or environment      ║${CL}"
+    echo -e "${YW}║  variables and update the placeholder values.              ║${CL}"
+    echo -e "${YW}╚════════════════════════════════════════════════════════════╝${CL}"
+    echo ""
+    return 1
+  fi
+  return 0
+}
+
+# Where to read an answer from, or failure when nobody can answer. Incus has no /dev/tty.
+_cs_stdin_source() {
+  if : 2>/dev/null </dev/tty; then
+    printf '/dev/tty'
+  elif [[ -t 0 || "${CS_STDIN_OK:-0}" == "1" ]]; then
+    printf '/dev/stdin'
+  else
+    return 1
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# prompt_confirm()
+#
+# - Prompts user for yes/no confirmation with timeout and unattended support
+# - In unattended mode: immediately returns default value
+# - In interactive mode: waits for user input with configurable timeout
+# - After timeout: auto-applies default value
+#
+# Arguments:
+#   $1 - Prompt message (required)
+#   $2 - Default value: "y" or "n" (optional, default: "n")
+#   $3 - Timeout in seconds (optional, default: 60)
+#
+# Returns:
+#   0 - User confirmed (yes)
+#   1 - User declined (no) or timeout with default "n"
+#
+# Example:
+#   if prompt_confirm "Proceed with installation?" "y" 30; then
+#     echo "Installing..."
+#   fi
+#
+#   # Unattended: prompt_confirm will use default without waiting
+#   var_unattended=yes
+#   prompt_confirm "Delete files?" "n" && echo "Deleting" || echo "Skipped"
+# ------------------------------------------------------------------------------
+prompt_confirm() {
+  local message="${1:-Confirm?}"
+  local default="${2:-n}"
+  local timeout="${3:-60}"
+  local response
+
+  # Normalize default to lowercase
+  default="${default,,}"
+  [[ "$default" != "y" ]] && default="n"
+
+  # Build prompt hint
+  local hint
+  if [[ "$default" == "y" ]]; then
+    hint="[Y/n]"
+  else
+    hint="[y/N]"
+  fi
+
+  # Unattended mode: apply default immediately
+  if is_unattended; then
+    if [[ "$default" == "y" ]]; then
+      return 0
+    else
+      return 1
+    fi
+  fi
+
+  local prompt_src
+  if ! prompt_src="$(_cs_stdin_source)"; then
+    if [[ "$default" == "y" ]]; then
+      return 0
+    else
+      return 1
+    fi
+  fi
+
+  # Interactive prompt with timeout
+  echo -en "${YW}${message} ${hint} (auto-${default} in ${timeout}s): ${CL}"
+
+  if read -t "$timeout" -r response <"$prompt_src"; then
+    # User provided input
+    response="${response,,}" # lowercase
+    case "$response" in
+    y | yes)
+      return 0
+      ;;
+    n | no)
+      return 1
+      ;;
+    "")
+      # Empty response, use default
+      if [[ "$default" == "y" ]]; then
+        return 0
+      else
+        return 1
+      fi
+      ;;
+    *)
+      # Invalid input, use default
+      echo -e "${YW}Invalid response, using default: ${default}${CL}"
+      if [[ "$default" == "y" ]]; then
+        return 0
+      else
+        return 1
+      fi
+      ;;
+    esac
+  else
+    # Timeout occurred
+    echo "" # Newline after timeout
+    echo -e "${YW}Timeout - auto-selecting: ${default}${CL}"
+    if [[ "$default" == "y" ]]; then
+      return 0
+    else
+      return 1
+    fi
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# confirm_external_installer()
+#
+#   confirm_external_installer <source> <installer>
+#
+# - Warns that a third-party installer is about to run and asks to continue
+# - var_external_installer answers it, so unattended runs can say yes or no.
+#   prompt_confirm is no use here: it takes its default without asking in
+#   every non-advanced mode, and the default has to be no
+# - Exits 10 when declined
+# ------------------------------------------------------------------------------
+confirm_external_installer() {
+  local source="$1" installer="$2" answer="${var_external_installer:-}"
+  msg_warn "WARNING: This script will run an external installer from a third-party source (${source})."
+  msg_warn "The following code is NOT maintained or audited by our repository."
+  msg_warn "If you have any doubts or concerns, please review the installer code before proceeding:"
+  msg_custom "${TAB3}${GATEWAY}${BGN}${CL}" "\e[1;34m" "→  ${installer}"
+  echo
+  # 254 is the user declining; 10 would read as "needs privileged mode".
+  if [[ -z "$answer" ]] && ! read -r -p "${TAB3}Do you want to continue? [y/N]: " answer; then
+    msg_error "No terminal to confirm on. Set var_external_installer=yes to run it unattended."
+    exit 254
+  fi
+  if [[ ! "${answer,,}" =~ ^(y|yes|true)$ ]]; then
+    if [[ -n "${var_external_installer:-}" ]]; then
+      msg_error "var_external_installer=${var_external_installer} declines the upstream installer, and this script has no other way to install. Set it to yes, or leave it unset to be asked."
+    else
+      msg_error "Aborted by user. No changes have been made."
+    fi
+    exit 254
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# prompt_input()
+#
+# - Prompts user for text input with timeout and unattended support
+# - In unattended mode: immediately returns default value
+# - In interactive mode: waits for user input with configurable timeout
+# - After timeout: auto-applies default value
+#
+# Arguments:
+#   $1 - Prompt message (required)
+#   $2 - Default value (optional, default: "")
+#   $3 - Timeout in seconds (optional, default: 60)
+#
+# Output:
+#   Prints the user input or default value to stdout
+#
+# Example:
+#   username=$(prompt_input "Enter username:" "admin" 30)
+#   echo "Using username: $username"
+#
+#   # With validation
+#   while true; do
+#     port=$(prompt_input "Enter port:" "8080" 30)
+#     [[ "$port" =~ ^[0-9]+$ ]] && break
+#     echo "Invalid port number"
+#   done
+# ------------------------------------------------------------------------------
+prompt_input() {
+  local message="${1:-Enter value:}"
+  local default="${2:-}"
+  local timeout="${3:-60}"
+  local response
+
+  # Build display default hint
+  local hint=""
+  [[ -n "$default" ]] && hint=" (default: ${default})"
+
+  # Unattended mode: return default immediately
+  if is_unattended; then
+    echo "$default"
+    return 0
+  fi
+
+  # Check if running in a TTY
+  if [[ ! -t 0 ]]; then
+    # Not a TTY, use default
+    echo "$default"
+    return 0
+  fi
+
+  # Interactive prompt with timeout
+  echo -en "${YW}${message}${hint} (auto-default in ${timeout}s): ${CL}" >&2
+
+  if read -t "$timeout" -r response </dev/tty; then
+    # User provided input (or pressed Enter for empty)
+    if [[ -n "$response" ]]; then
+      echo "$response"
+    else
+      echo "$default"
+    fi
+  else
+    # Timeout occurred
+    echo "" >&2 # Newline after timeout
+    echo -e "${YW}Timeout - using default: ${default}${CL}" >&2
+    echo "$default"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# prompt_input_required()
+#
+# - Prompts user for REQUIRED text input with fallback support
+# - In unattended mode: Uses fallback value if no env var set (with warning)
+# - In interactive mode: loops until user provides non-empty input
+# - Tracks missing required values for end-of-script summary
+#
+# Arguments:
+#   $1 - Prompt message (required)
+#   $2 - Fallback/example value for unattended mode (optional)
+#   $3 - Timeout in seconds (optional, default: 120)
+#   $4 - Environment variable name hint for error messages (optional)
+#
+# Output:
+#   Prints the user input or fallback value to stdout
+#
+# Returns:
+#   0 - Success (value provided or fallback used)
+#   1 - Failed (interactive timeout without input)
+#
+# Global:
+#   MISSING_REQUIRED_VALUES - Array tracking fields that used fallbacks
+#
+# Example:
+#   # With fallback - script continues even in unattended mode
+#   token=$(prompt_input_required "Enter API Token:" "YOUR_TOKEN_HERE" 60 "var_api_token")
+#
+#   # Check at end of script if any values need manual configuration
+#   if [[ ${#MISSING_REQUIRED_VALUES[@]} -gt 0 ]]; then
+#     msg_warn "Please configure: ${MISSING_REQUIRED_VALUES[*]}"
+#   fi
+# ------------------------------------------------------------------------------
+# Global array to track missing required values
+declare -g -a MISSING_REQUIRED_VALUES=()
+
+prompt_input_required() {
+  local message="${1:-Enter required value:}"
+  local fallback="${2:-CHANGE_ME}"
+  local timeout="${3:-120}"
+  local env_var_hint="${4:-}"
+  local response=""
+
+  # Check if value is already set via environment variable (if hint provided)
+  if [[ -n "$env_var_hint" ]]; then
+    local env_value="${!env_var_hint:-}"
+    if [[ -n "$env_value" ]]; then
+      echo "$env_value"
+      return 0
+    fi
+  fi
+
+  # Unattended mode: use fallback with warning
+  if is_unattended; then
+    if [[ -n "$env_var_hint" ]]; then
+      echo -e "${YW}⚠ Required value '${env_var_hint}' not set - using fallback: ${fallback}${CL}" >&2
+      MISSING_REQUIRED_VALUES+=("$env_var_hint")
+    else
+      echo -e "${YW}⚠ Required value not provided - using fallback: ${fallback}${CL}" >&2
+      MISSING_REQUIRED_VALUES+=("(unnamed)")
+    fi
+    echo "$fallback"
+    return 0
+  fi
+
+  # Check if running in a TTY
+  if [[ ! -t 0 ]]; then
+    echo -e "${YW}⚠ Not interactive - using fallback: ${fallback}${CL}" >&2
+    MISSING_REQUIRED_VALUES+=("${env_var_hint:-unnamed}")
+    echo "$fallback"
+    return 0
+  fi
+
+  # Interactive prompt - loop until non-empty input or use fallback on timeout
+  local attempts=0
+  while [[ -z "$response" ]]; do
+    attempts=$((attempts + 1))
+
+    if [[ $attempts -gt 3 ]]; then
+      echo -e "${YW}Too many empty inputs - using fallback: ${fallback}${CL}" >&2
+      MISSING_REQUIRED_VALUES+=("${env_var_hint:-manual_input}")
+      echo "$fallback"
+      return 0
+    fi
+
+    echo -en "${YW}${message} (required, timeout ${timeout}s): ${CL}" >&2
+
+    if read -t "$timeout" -r response </dev/tty; then
+      if [[ -z "$response" ]]; then
+        echo -e "${YW}This field is required. Please enter a value. (attempt ${attempts}/3)${CL}" >&2
+      fi
+    else
+      # Timeout occurred - use fallback
+      echo "" >&2
+      echo -e "${YW}Timeout - using fallback value: ${fallback}${CL}" >&2
+      MISSING_REQUIRED_VALUES+=("${env_var_hint:-timeout}")
+      echo "$fallback"
+      return 0
+    fi
+  done
+
+  echo "$response"
+}
+
+# ------------------------------------------------------------------------------
+# prompt_select()
+#
+# - Prompts user to select from a list of options with timeout support
+# - In unattended mode: immediately returns default selection
+# - In interactive mode: displays numbered menu and waits for choice
+# - After timeout: auto-applies default selection
+#
+# Arguments:
+#   $1 - Prompt message (required)
+#   $2 - Default option number, 1-based (optional, default: 1)
+#   $3 - Timeout in seconds (optional, default: 60)
+#   $4+ - Options to display (required, at least 2)
+#
+# Output:
+#   Prints the selected option value to stdout
+#
+# Returns:
+#   0 - Success
+#   1 - No options provided or invalid state
+#
+# Example:
+#   choice=$(prompt_select "Select database:" 1 30 "PostgreSQL" "MySQL" "SQLite")
+#   echo "Selected: $choice"
+#
+#   # With array
+#   options=("Option A" "Option B" "Option C")
+#   selected=$(prompt_select "Choose:" 2 60 "${options[@]}")
+# ------------------------------------------------------------------------------
+prompt_select() {
+  local message="${1:-Select option:}"
+  local default="${2:-1}"
+  local timeout="${3:-60}"
+  shift 3
+
+  local options=("$@")
+  local num_options=${#options[@]}
+
+  # Validate options
+  if [[ $num_options -eq 0 ]]; then
+    echo "" >&2
+    return 1
+  fi
+
+  # Validate default
+  if [[ ! "$default" =~ ^[0-9]+$ ]] || [[ "$default" -lt 1 ]] || [[ "$default" -gt "$num_options" ]]; then
+    default=1
+  fi
+
+  # Unattended mode: return default immediately
+  if is_unattended; then
+    echo "${options[$((default - 1))]}"
+    return 0
+  fi
+
+  # The read below takes /dev/tty, not stdin, so a piped or exhausted stdin says
+  # nothing about whether the operator can answer. Testing -t 0 here meant that
+  # `curl ... | bash` silently took the default without ever printing the menu --
+  # which on a mixed-GPU host handed the container the iGPU and never said so.
+  # Ask whenever a terminal is reachable at all.
+  if [[ ! -r /dev/tty ]]; then
+    echo "${options[$((default - 1))]}"
+    return 0
+  fi
+
+  # Display menu
+  echo -e "${YW}${message}${CL}" >&2
+  local i
+  for i in "${!options[@]}"; do
+    local num=$((i + 1))
+    if [[ $num -eq $default ]]; then
+      echo -e "  ${GN}${num})${CL} ${options[$i]} ${YW}(default)${CL}" >&2
+    else
+      echo -e "  ${GN}${num})${CL} ${options[$i]}" >&2
+    fi
+  done
+
+  # Interactive prompt with timeout
+  echo -en "${YW}Select [1-${num_options}] (auto-select ${default} in ${timeout}s): ${CL}" >&2
+
+  local response
+  if read -t "$timeout" -r response </dev/tty; then
+    if [[ -z "$response" ]]; then
+      # Empty response, use default
+      echo "${options[$((default - 1))]}"
+    elif [[ "$response" =~ ^[0-9]+$ ]] && [[ "$response" -ge 1 ]] && [[ "$response" -le "$num_options" ]]; then
+      # Valid selection
+      echo "${options[$((response - 1))]}"
+    else
+      # Invalid input, use default
+      echo -e "${YW}Invalid selection, using default: ${options[$((default - 1))]}${CL}" >&2
+      echo "${options[$((default - 1))]}"
+    fi
+  else
+    # Timeout occurred
+    echo "" >&2 # Newline after timeout
+    echo -e "${YW}Timeout - auto-selecting: ${options[$((default - 1))]}${CL}" >&2
+    echo "${options[$((default - 1))]}"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# prompt_password()
+#
+# - Prompts user for password input with hidden characters
+# - In unattended mode: returns default or generates random password
+# - Supports auto-generation of secure passwords
+# - After timeout: generates random password if allowed
+#
+# Arguments:
+#   $1 - Prompt message (required)
+#   $2 - Default value or "generate" for auto-generation (optional)
+#   $3 - Timeout in seconds (optional, default: 60)
+#   $4 - Minimum length for validation (optional, default: 0 = no minimum)
+#
+# Output:
+#   Prints the password to stdout
+#
+# Example:
+#   password=$(prompt_password "Enter password:" "generate" 30 8)
+#   echo "Password set"
+#
+#   # Require user input (no default)
+#   db_pass=$(prompt_password "Database password:" "" 60 12)
+# ------------------------------------------------------------------------------
+# random_password [length] - alphanumeric, because base64 carries / and +.
+# Reads a fixed chunk rather than piping urandom into head, which SIGPIPEs.
+random_password() {
+  local len="${1:-24}" out=""
+  while ((${#out} < len)); do
+    out+="$(LC_ALL=C tr -dc 'A-Za-z0-9' < <(head -c 256 /dev/urandom))"
+  done
+  printf '%s' "${out:0:len}"
+}
+
+prompt_password() {
+  local message="${1:-Enter password:}"
+  local default="${2:-}"
+  local timeout="${3:-60}"
+  local min_length="${4:-0}"
+  local response
+
+  # Generate random password if requested
+  local generated=""
+  if [[ "$default" == "generate" ]]; then
+    generated=$(random_password 16)
+    default="$generated"
+  fi
+
+  # Unattended mode: return default immediately
+  if is_unattended; then
+    echo "$default"
+    return 0
+  fi
+
+  # Check if running in a TTY
+  if [[ ! -t 0 ]]; then
+    echo "$default"
+    return 0
+  fi
+
+  # Build hint
+  local hint=""
+  if [[ -n "$generated" ]]; then
+    hint=" (Enter for auto-generated)"
+  elif [[ -n "$default" ]]; then
+    hint=" (Enter for default)"
+  fi
+  [[ "$min_length" -gt 0 ]] && hint="${hint} [min ${min_length} chars]"
+
+  # Interactive prompt with timeout (silent input)
+  echo -en "${YW}${message}${hint} (timeout ${timeout}s): ${CL}" >&2
+
+  if read -t "$timeout" -rs response </dev/tty; then
+    echo "" >&2 # Newline after hidden input
+    if [[ -n "$response" ]]; then
+      # Validate minimum length
+      if [[ "$min_length" -gt 0 ]] && [[ ${#response} -lt "$min_length" ]]; then
+        echo -e "${YW}Password too short (min ${min_length}), using default${CL}" >&2
+        echo "$default"
+      else
+        echo "$response"
+      fi
+    else
+      echo "$default"
+    fi
+  else
+    # Timeout occurred
+    echo "" >&2 # Newline after timeout
+    echo -e "${YW}Timeout - using generated password${CL}" >&2
+    echo "$default"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# cs_testing_state()
+#
+# Decides whether this is a testing build and where feedback should go.
+# Sets CS_TESTING (yes / empty) and CS_TESTING_URL (validated, may be empty).
+#
+# var_testurl is declared by the script, not configured by the user: a script
+# under test points at the thread collecting its feedback. It is additive --
+# a DevScripts script without one still gets the generic warning, so the
+# variable can be filled in one script at a time without a flag day. A script
+# promoted to ProxmoxVE keeps asking for feedback as long as it carries one.
+#
+# The URL is checked strictly because of where it ends up. The MOTD is a shell
+# script generated through an unquoted heredoc, so a `$(...)` in the value would
+# execute; the container description is HTML, where a quote would break out of
+# the attribute. The character set below therefore excludes $ ` ( ) \ ' " and
+# whitespace. This is not a privilege boundary -- the calling script is already
+# arbitrary bash -- it is so that a typo cannot break the container's login
+# shell. A rejected value falls back to the generic message instead of failing
+# the build, because a bad link is not worth losing a container over.
+#
+# Exported because the container needs both: the MOTD is written from inside it
+# by lxc/install.func, and lxc-attach carries the caller's environment.
+# ------------------------------------------------------------------------------
+cs_testing_state() {
+  CS_TESTING=""
+  CS_TESTING_URL=""
+
+  local url="${var_testurl:-}"
+  if [[ -n "$url" ]]; then
+    local url_re='^https://[A-Za-z0-9._~:/?#@!&*+,;=%-]+$'
+    if ((${#url} <= 200)) && [[ "$url" =~ $url_re ]]; then
+      CS_TESTING_URL="$url"
+      CS_TESTING="yes"
+    else
+      msg_warn "Ignoring var_testurl: expected a plain https URL of at most 200 characters"
+    fi
+  fi
+
+  # DevScripts is the testing repository, so its scripts are testing builds
+  # whether or not they name a thread yet.
+  [[ -z "$CS_TESTING" && "${REPO_SOURCE:-}" == "DevScripts" ]] && CS_TESTING="yes"
+
+  export CS_TESTING CS_TESTING_URL
+}
+
+# ==============================================================================
+# SECTION 6: CLEANUP & MAINTENANCE
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# cleanup_lxc()
+#
+# - Cleans package manager and language caches (safe for installs AND updates)
+# - Supports Alpine (apk), Debian/Ubuntu (apt), other distros through install.func's
+#   pkg_clean, and Python, Node.js, Go, Rust, Ruby, PHP caches
+# - Uses fallback error handling to prevent cleanup failures from breaking installs
+# ------------------------------------------------------------------------------
+cleanup_lxc() {
+  msg_info "Cleaning up"
+
+  if is_alpine; then
+    # 2>/dev/null like the apt lines below: the rm on the next line removes the
+    # package index, so a second run finds nothing to clean and apk says so on
+    # stderr -- "opening from cache ... APKINDEX.tar.gz: No such file or
+    # directory", printed over the spinner. An empty cache is the goal, not a
+    # problem worth reporting.
+    $STD apk cache clean 2>/dev/null || true
+    rm -rf /var/cache/apk/*
+  elif command -v dnf &>/dev/null; then
+    $STD dnf -y autoremove 2>/dev/null || msg_warn "dnf autoremove failed (non-critical)"
+    $STD dnf clean all 2>/dev/null || msg_warn "dnf clean failed (non-critical)"
+  elif command -v zypper &>/dev/null; then
+    $STD zypper clean 2>/dev/null || msg_warn "zypper clean failed (non-critical)"
+  elif command -v pacman &>/dev/null; then
+    $STD pacman -Sc --noconfirm 2>/dev/null || msg_warn "pacman clean failed (non-critical)"
+  elif command -v apt-get &>/dev/null; then
+    $STD apt -y autoremove 2>/dev/null || msg_warn "apt autoremove failed (non-critical)"
+    $STD apt -y clean 2>/dev/null || msg_warn "apt clean failed (non-critical)"
+  elif declare -f pkg_clean >/dev/null 2>&1; then
+    pkg_clean 2>/dev/null || msg_warn "Package cache cleanup failed (non-critical)"
+  fi
+
+  find /tmp /var/tmp -type f -name 'tmp*' -delete 2>/dev/null || true
+  find /tmp /var/tmp -type f -name 'tempfile*' -delete 2>/dev/null || true
+
+  # Python
+  if command -v pip &>/dev/null; then
+    rm -rf /root/.cache/pip 2>/dev/null || true
+  fi
+  if command -v uv &>/dev/null; then
+    rm -rf /root/.cache/uv 2>/dev/null || true
+  fi
+
+  # Node.js
+  if command -v npm &>/dev/null; then
+    rm -rf /root/.npm/_cacache /root/.npm/_logs 2>/dev/null || true
+  fi
+  if command -v yarn &>/dev/null; then
+    # yarn 1 run as root caches under /usr/local/share, not in $HOME
+    rm -rf /root/.cache/yarn /root/.yarn/cache /root/.yarn/berry/cache /usr/local/share/.cache/yarn 2>/dev/null || true
+  fi
+  if command -v pnpm &>/dev/null; then
+    pnpm store prune &>/dev/null || true
+  fi
+
+  # Go (only build cache, not modules)
+  if command -v go &>/dev/null; then
+    $STD go clean -cache 2>/dev/null || true
+  fi
+
+  # Rust (registry cache and toolchains a build pulled in, not build artifacts)
+  if command -v cargo &>/dev/null; then
+    rm -rf /root/.cargo/registry/cache /root/.cargo/.package-cache 2>/dev/null || true
+    declare -f rust_prune_toolchains >/dev/null 2>&1 && rust_prune_toolchains
+  fi
+
+  # Ruby
+  if command -v gem &>/dev/null; then
+    rm -rf /root/.gem/cache 2>/dev/null || true
+  fi
+
+  # PHP
+  if command -v composer &>/dev/null; then
+    rm -rf /root/.composer/cache 2>/dev/null || true
+  fi
+
+  msg_ok "Cleaned"
+
+  # Installs only. An update reaches here through update_script without ever
+  # calling post_to_api, so nothing would follow the ping with a terminal
+  # status and the row stayed "configuring" for good.
+  if [[ -n "${POST_TO_API_DONE:-}" ]] && declare -f post_progress_to_api &>/dev/null; then
+    post_progress_to_api
+  fi
+}
+# ------------------------------------------------------------------------------
+# check_or_create_swap()
+#
+# - Checks if swap is active on system
+# - Offers to create swap file if none exists
+# - Prompts user for swap size in MB
+# - Creates /swapfile with specified size
+# - Activates swap immediately
+# - Returns 0 if swap active or successfully created, 1 if declined/failed
+# ------------------------------------------------------------------------------
+check_or_create_swap() {
+  msg_info "Checking for active swap"
+
+  if swapon --noheadings --show | grep -q 'swap'; then
+    msg_ok "Swap is active"
+    return 0
+  fi
+
+  msg_error "No active swap detected"
+
+  if ! prompt_confirm "Do you want to create a swap file?" "n" 60; then
+    msg_custom "ℹ️" "${YW}" "Skipping swap file creation"
+    return 1
+  fi
+
+  local swap_size_mb
+  swap_size_mb=$(prompt_input "Enter swap size in MB (e.g., 2048 for 2GB):" "2048" 60)
+  if ! [[ "$swap_size_mb" =~ ^[0-9]+$ ]]; then
+    msg_error "Invalid size input. Aborting."
+    return 1
+  fi
+
+  local swap_file="/swapfile"
+
+  msg_info "Creating ${swap_size_mb}MB swap file at $swap_file"
+  if dd if=/dev/zero of="$swap_file" bs=1M count="$swap_size_mb" status=progress &&
+    chmod 600 "$swap_file" &&
+    mkswap "$swap_file" &&
+    swapon "$swap_file"; then
+    msg_ok "Swap file created and activated successfully"
+  else
+    msg_error "Failed to create or activate swap"
+    return 1
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Loads LOCAL_IP from persistent store or detects if missing.
+#
+# Description:
+#   - Loads from /run/local-ip.env or performs runtime lookup
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# _get_current_ip()
+#
+# - Internal helper: detects the container's primary IP address
+# - Tries eth0 interface first, then hostname -I, then routing table
+# - Falls back to IPv6 if no IPv4 address found
+# - Returns IP on stdout, or empty string on failure
+# ------------------------------------------------------------------------------
+_get_current_ip() {
+  local ip
+
+  # Try direct interface lookup for eth0 FIRST (most reliable for LXC) - IPv4
+  ip=$(ip -4 addr show eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+  if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "$ip"
+    return 0
+  fi
+
+  # Fallback: Try hostname -I (returns IPv4 first if available)
+  if command -v hostname >/dev/null 2>&1; then
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  fi
+
+  # Try routing table with IPv4 targets
+  local ipv4_targets=("8.8.8.8" "1.1.1.1" "default")
+  for target in "${ipv4_targets[@]}"; do
+    if [[ "$target" == "default" ]]; then
+      ip=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
+    else
+      ip=$(ip route get "$target" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
+    fi
+    if [[ -n "$ip" ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+
+  # IPv6 fallback: Try direct interface lookup for eth0
+  ip=$(ip -6 addr show eth0 scope global 2>/dev/null | awk '/inet6 / {print $2}' | cut -d/ -f1 | head -n1)
+  if [[ -n "$ip" && "$ip" =~ : ]]; then
+    echo "$ip"
+    return 0
+  fi
+
+  # IPv6 fallback: Try hostname -I for IPv6
+  if command -v hostname >/dev/null 2>&1; then
+    ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E ':' | head -n1)
+    if [[ -n "$ip" && "$ip" =~ : ]]; then
+      echo "$ip"
+      return 0
+    fi
+  fi
+
+  # IPv6 fallback: Use routing table with IPv6 targets
+  local ipv6_targets=("2001:4860:4860::8888" "2606:4700:4700::1111")
+  for target in "${ipv6_targets[@]}"; do
+    ip=$(ip -6 route get "$target" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
+    if [[ -n "$ip" && "$ip" =~ : ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+function get_lxc_ip() {
+  local IP_FILE="/run/local-ip.env"
+  if [[ -f "$IP_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$IP_FILE"
+  fi
+
+  if [[ -z "${LOCAL_IP:-}" ]]; then
+    LOCAL_IP="$(_get_current_ip || true)"
+    if [[ -z "$LOCAL_IP" ]]; then
+      msg_error "Could not determine LOCAL_IP"
+      return 1
+    fi
+  fi
+
+  export LOCAL_IP
+}
+
+# ------------------------------------------------------------------------------
+# apt_update_safe()
+#
+# - Runs apt-get update without letting a partial failure abort the caller
+# - Retries up to three times; a mirror hiccup is the usual cause
+# - Leaves the caller's shell options and ERR trap untouched
+# - Warns after the last attempt and hints at the enterprise-repo 401/403 case
+# ------------------------------------------------------------------------------
+apt_update_safe() {
+  local logfile rc=0 attempt from
+  logfile="$(get_active_logfile)"
+
+  # `|| rc=$?` is exempt from errexit and the ERR trap, so nothing here has to
+  # touch the caller's shell options.
+  for attempt in 1 2 3; do
+    from=$(($(wc -l <"$logfile" 2>/dev/null || echo 0) + 1))
+    rc=0
+    apt-get update >>"$logfile" 2>&1 || rc=$?
+    if [[ "${VERBOSE:-no}" == "yes" ]]; then
+      tail -n "+${from}" "$logfile" 2>/dev/null
+    fi
+    if ((rc == 0)); then
+      return 0
+    fi
+    if ((attempt < 3)); then
+      sleep $((attempt * 5))
+    fi
+  done
+
+  if [[ $rc -ne 0 ]]; then
+    msg_warn "apt-get update exited with code ${rc} after 3 attempts — some repositories may have failed."
+
+    # Check log for common 401/403 enterprise repo issues
+    if tail -n "+${from}" "$logfile" 2>/dev/null | grep -qiE '401\s*Unauthorized|403\s*Forbidden|enterprise\.proxmox\.com'; then
+      echo -e "${TAB}${INFO} ${YWB}Hint: Proxmox enterprise repository returned an auth error.${CL}"
+      echo -e "${TAB}       If you don't have a subscription, you can disable the enterprise"
+      echo -e "${TAB}       repo and use the no-subscription repo instead."
+    fi
+
+    echo -e "${TAB}${INFO} ${YWB}Continuing despite partial update failure — packages may still be installable.${CL}"
+    echo ""
+  fi
+
+  return 0
+}
+
+# dpkg's conffile prompt has no tty during an update and takes the whole run
+# with it. APT_CONFIG is read after apt.conf.d and dies with the process, so an
+# early exit cannot leave a drop-in behind.
+_cs_conffile_list() {
+  # 2>/dev/null hides find's message about an unreadable /etc/credstore, not its
+  # exit status, which pipefail then passes on as if sort had failed.
+  { find "${_CS_CONFFILE_ROOT:-/etc}" -maxdepth 6 \( -name '*.dpkg-dist' -o -name '*.dpkg-new' \) 2>/dev/null || true; } | LC_ALL=C sort
+}
+
+apt_conffile_guard() {
+  command -v apt-get >/dev/null 2>&1 || return 0
+  [[ -n "${_CS_CONFFILE_GUARD:-}" ]] && return 0
+
+  local conf
+  conf="$(mktemp 2>/dev/null)" || return 0
+  printf 'Dpkg::Options { "--force-confdef"; "--force-confold"; };\n' >"$conf" 2>/dev/null || {
+    rm -f "$conf"
+    return 0
+  }
+
+  export APT_CONFIG="$conf"
+  _CS_CONFFILE_GUARD="$conf"
+  _CS_CONFFILE_BASELINE="$(_cs_conffile_list)"
+  return 0
+}
+
+apt_conffile_report() {
+  [[ -n "${_CS_CONFFILE_GUARD:-}" ]] || return 0
+
+  local added
+  added="$(LC_ALL=C comm -13 <(printf '%s\n' "${_CS_CONFFILE_BASELINE:-}") <(_cs_conffile_list) 2>/dev/null)"
+  rm -f "$_CS_CONFFILE_GUARD"
+  _CS_CONFFILE_GUARD=""
+  unset APT_CONFIG
+  [[ -n "${added//[[:space:]]/}" && -z "${_CS_CONFFILE_QUIET:-}" ]] || return 0
+
+  msg_warn "Kept your version of these config files - upstream shipped changes to them too:"
+  local f
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    echo -e "${TAB}${YW}${f%.dpkg-*}${CL} - new upstream version at ${YW}${f}${CL}"
+  done <<<"$added"
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# ensure_whiptail()
+#
+# - Ensures whiptail is installed
+# - Some ARM64 systems will not have whiptail installed
+# - Exits with error message if installation fails
+# ------------------------------------------------------------------------------
+ensure_whiptail() {
+  command -v whiptail >/dev/null 2>&1 && return 0
+
+  msg_info "Installing whiptail"
+  apt_update_safe
+  $STD apt-get install -y whiptail || {
+    msg_error "Failed to install whiptail"
+    exit 100
+  }
+  msg_ok "Installed whiptail"
+}
+
+# ------------------------------------------------------------------------------
+# arm64_notice()
+#
+# - Shows a short warning when running scripts on ARM64 systems
+# ------------------------------------------------------------------------------
+arm64_notice() {
+  [[ "$(_cs_host_arch)" == "arm64" ]] || return 0
+
+  whiptail --backtitle "Proxmox VE Helper Scripts" \
+    --title "ARM64 SUPPORT" \
+    --ok-button "Continue" \
+    --msgbox "ARM64 support is in active development.\n\nSome scripts, packages, or application releases may not be fully tested or working yet." 10 68
+}
+# ==============================================================================
+# SIGNAL TRAPS
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# on_hup_keepalive()
+#
+# - SIGHUP (terminal hangup) trap handler
+# - Keeps long-running scripts alive if terminal/SSH session disconnects
+# - Stops spinner safely and writes warning to active log
+# ------------------------------------------------------------------------------
+on_hup_keepalive() {
+  if declare -F on_hangup >/dev/null; then
+    on_hangup
+    return
+  fi
+  stop_spinner
+  # The next write to the dead terminal failed with EIO and ended the tool.
+  local log
+  log="$(get_active_logfile 2>/dev/null)"
+  exec </dev/null >>"${log:-/dev/null}" 2>&1
+  export _CS_HANGUP=1 CS_ANIMATION_OK=0 _CS_HANGUP_LOG="${log:-/dev/null}"
+  log_msg "[WARN] Received SIGHUP (terminal hangup). Continuing execution in background."
+}
+
+# ------------------------------------------------------------------------------
+# arch_resolve()
+#
+# - Selects an architecture-specific value while preserving amd64 defaults
+# - Usage: arch_resolve "amd64-value" "arm64-value"
+# - Defaults: amd64="amd64", arm64="arm64"
+# ------------------------------------------------------------------------------
+arch_resolve() {
+  local amd64_val="${1:-amd64}"
+  local arm64_val="${2:-arm64}"
+  local arch="${PCT_ARCH:-$(_cs_host_arch)}"
+  case "$arch" in
+  amd64 | x86_64) echo "$amd64_val" ;;
+  arm64 | aarch64) echo "$arm64_val" ;;
+  *)
+    msg_error "Unsupported architecture: $arch"
+    return 106
+    ;;
+  esac
+}
+
+trap 'on_hup_keepalive' HUP
+trap 'stop_spinner' EXIT INT TERM

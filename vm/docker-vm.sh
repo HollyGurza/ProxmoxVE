@@ -9,7 +9,7 @@
 # ==============================================================================
 
 COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local}"
-source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/core/main}/pve/vm-core.func")
+source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}/pve/vm-core.func")
 load_functions
 
 # ==============================================================================
@@ -384,7 +384,7 @@ msg_ok "Resized disk image"
 msg_info "Creating Docker VM shell"
 
 qm create $VMID -agent 1${MACHINE} -tablet 0 -localtime 1 -bios ovmf${CPU_TYPE} -cores $CORE_COUNT -memory $RAM_SIZE \
-  -name $HN -tags community-script -net0 virtio,bridge=$BRG,macaddr=$MAC$VLAN$MTU -onboot 1 -ostype l26 -scsihw virtio-scsi-pci >/dev/null
+  -name $HN -tags community-script-local -net0 virtio,bridge=$BRG,macaddr=$MAC$VLAN$MTU -onboot 1 -ostype l26 -scsihw virtio-scsi-pci >/dev/null
 
 msg_ok "Created VM shell"
 

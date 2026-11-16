@@ -4,7 +4,7 @@
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 
 COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local}"
-source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/core/main}/pve/vm-core.func")
+source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}/pve/vm-core.func")
 load_functions
 
 #API VARIABLES
@@ -392,7 +392,7 @@ msg_info "Creating a OPNsense VM"
 # A firewall VM filters itself: Proxmox's per-NIC firewall off, and virtio
 # multiqueue matched to the cores so routing scales past one vCPU.
 qm create $VMID -agent 1${MACHINE} -tablet 0 -bios ovmf${CPU_TYPE} -cores $CORE_COUNT -memory $RAM_SIZE -balloon 0 \
-  -name $HN -tags community-script -net0 virtio,bridge=$BRG,macaddr=$MAC,firewall=0,queues=$CORE_COUNT$VLAN$MTU -onboot 1 -ostype l26 -scsihw virtio-scsi-pci
+  -name $HN -tags community-script-local -net0 virtio,bridge=$BRG,macaddr=$MAC,firewall=0,queues=$CORE_COUNT$VLAN$MTU -onboot 1 -ostype l26 -scsihw virtio-scsi-pci
 vm_mark_created
 
 # Retry pvesm alloc on transient zfs_request "got timeout" errors (#14127)
@@ -418,7 +418,7 @@ qm set $VMID \
   -scsi0 "${VM_IMPORTED_DISK}",${DISK_CACHE}${THIN}size=2G \
   -boot order=scsi0 \
   -serial0 socket \
-  -tags community-script >/dev/null
+  -tags community-script-local >/dev/null
 vm_resize_disk
 set_description
 

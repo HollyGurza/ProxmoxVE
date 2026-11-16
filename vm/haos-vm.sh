@@ -4,7 +4,7 @@
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 
 COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local}"
-source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/core/main}/pve/vm-core.func")
+source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}/pve/vm-core.func")
 load_functions
 
 GEN_MAC=02:$(openssl rand -hex 5 | awk '{print toupper($0)}' | sed 's/\(..\)/\1:/g; s/.$//')
@@ -121,7 +121,7 @@ vm_fetch_image "$URL" "$CACHE_FILE" --cache --verify-xz || exit 115
 
 msg_info "Creating Home Assistant OS VM shell"
 qm create $VMID${MACHINE} -bios ovmf -agent 1 -tablet 0 -localtime 1 ${CPU_TYPE} \
-  -cores "$CORE_COUNT" -memory "$RAM_SIZE" -name "$HN" -tags community-script \
+  -cores "$CORE_COUNT" -memory "$RAM_SIZE" -name "$HN" -tags community-script-local \
   -net0 "virtio,bridge=$BRG,macaddr=$MAC$VLAN$MTU" -onboot 1 -ostype l26 -scsihw virtio-scsi-pci >/dev/null
 msg_ok "Created VM shell"
 

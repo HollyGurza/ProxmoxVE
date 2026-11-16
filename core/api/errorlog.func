@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# Copyright (c) 2021-2026 community-scripts ORG
+# License: MIT | https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core/LICENSE
+
+# ==============================================================================
+# API/ERROR LOG EXTRACTION
+# ==============================================================================
+# Turns a failure into the telemetry error trace: which capture belongs to it,
+# what the failing step printed (progress chatter removed), and the one-line
+# header. Loaded through api/api.func; host side only.
+#
+# The .errinfo capture, written by silent() and the error handler:
+#
+#   EXIT_CODE=<n>
+#   LINE=<n>
+#   COMMAND=<command, one line>
+#   FUNCTION=<function the command ran in>
+#   STEP=<msg_info text of the running step>
+#   MESSAGE=<first msg_error of that step>
+#   PHASE=<host|container>
+#   --- OUTPUT ---
+#   <raw output>
+# ==============================================================================
+
+[[ -n "${_API_ERRORLOG_LOADED:-}" ]] && return 0
+_API_ERRORLOG_LOADED=1
+
+# json_escape <text> - JSON string body, control characters and ANSI removed
+json_escape() {
+  local input
+  input=$(printf '%s' "$1" |
+    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' |
+    tr -d '\000-\010\013\014\016-\037\177\r')
+
+  if command -v jq &>/dev/null; then
+    printf '%s' "$input" | jq -Rs '.' | sed 's/^"//;s/"$//'
+    return 0
+  fi
+
+  printf '%s' "$input" |
+    awk '
+        BEGIN { ORS="" }
+        {
+          if (NR > 1) printf "%s", "\\n"
+          for (i = 1; i <= length($0); i++) {
+            c = substr($0, i, 1)
+            if (c == "\\") printf "%s", "\\\\"
+            else if (c == "\"") printf "%s", "\\\""
+            else if (c == "\t") printf "%s", "\\t"
+            else printf "%s", c
+          }
+        }'
+}
+
+# Lines that never explain a failure.
+_TM_NOISE=(
+  '(Get|Hit|Ign):[0-9]+ ' 'Fetched [0-9]' 'Reading (package lists|state information|database)'
+  'Building dependency tree' '\(Reading database' 'Selecting previously unselected' 'Preparing to unpack'
+  'Unpacking ' 'Setting up ' 'Processing triggers for' 'update-alternatives: ' 'Created symlink '
+  "Removed ['\"]?/etc/systemd" 'Generating locales' 'Generation complete' 'Need to get [0-9]' 'After this operation'
+  '[0-9]+ upgraded, [0-9]+ newly installed' 'The following (NEW |additional )?packages will be'
+  'Updating certificates in' 'Running hooks in' '[0-9]+ added, [0-9]+ removed; done' 'done\.$'
+  '(Summary|Installing|Upgrading):$' '  (Upgrading|Installing): [0-9]+, ' '  (Download size|Space needed): '
+  'debconf: (unable to initialize frontend|\(|falling back to frontend|delaying package configuration)'
+  'invoke-rc\.d: (could not determine current runlevel|policy-rc\.d denied)'
+  'Could not execute systemctl: +at /usr/bin/deb-systemd-invoke' 'rehash: warning: skipping'
+  'Creating config file ' '(info: )?Adding (new )?(user|group|system user) ' 'info: (Selecting|Not creating|Creating home)'
+  '\([0-9]+/[0-9]+\) (Installing|Upgrading|Purging|Replacing) ' 'Executing [^ ]+\.(trigger|post-install|pre-install|post-upgrade)'
+  'OK: [0-9.]+ ?[KMG]i?B in [0-9]+ packages' 'fetch https?://'
+  ' +(Installing|Upgrading|Verifying|Running scriptlet|Preparing|Cleanup|Downgrading|Erasing) *: '
+  ' *[0-9]+K[ .]{10,}' 'Saving to: ' 'Length: [0-9]' 'Resolving [^ ]+ \(' 'Connecting to .*connected\.$'
+  'HTTP request sent, awaiting response\.\.\. (20[0-9]|30[0-9])' 'Location: .*\[following\]'
+  ' *% Total +% Received' ' *[0-9]+ +[0-9.]+[kMG]? +[0-9]+ +[0-9.]+[kMG]? +[0-9]+ +[0-9]+ .*[0-9:-]{8}'
+  'go: (downloading|finding|extracting) ' ' +(Compiling|Downloaded|Downloading|Fresh|Locking|Updating crates\.io index) '
+  '(Collecting|Using cached|Requirement already satisfied|Installing collected packages) '
+  ' *(Downloaded|Prepared|Installed|Resolved|Audited|Uninstalled|Built) [0-9]+ packages? ' ' [+-] [A-Za-z0-9_.-]+=='
+  'Using C?Python [0-9]' 'Creating virtual environment at' 'npm (warn|WARN) deprecated'
+  '(added|removed|changed) [0-9]+ packages' '[0-9]+ packages? (is|are) looking for funding' '  run `npm fund`'
+  'found 0 vulnerabilities' 'Progress: resolved [0-9]+' '\[[0-9]/[0-9]\] (Resolving|Fetching|Linking|Building)'
+  '(remote: )?(Enumerating|Counting|Compressing|Total) objects' 'Receiving objects:' 'Resolving deltas:' 'Updating files:'
+  '\++ '
+  '  WARNING: (You have not turned on protection|Set activation/thin_pool|Sum of all thin volume)'
+  '  Logical volume .* (created|changed)\.' 'Creating filesystem with' 'Filesystem UUID:' 'Superblock backups stored'
+  '[[:space:]]+[0-9]+(, [0-9]+)+,?$' '(Allocating group tables|Writing inode tables|Creating journal|Writing superblocks|Discarding device blocks)'
+  'extracting archive' 'Total bytes read:' 'Detected container architecture' 'Creating SSH host key' 'done: SHA256:'
+  '={20,}$' 'COMBINED INSTALLATION LOG' 'PHASE [0-9]+: ' '(Container ID|Session ID|Timestamp): '
+  '[[:space:]]*(⏳|✔|✖|💡|ℹ|🔧|📋)'
+)
+_TM_NOISE_RE="^($(IFS='|'; echo "${_TM_NOISE[*]}"))"
+
+# stdin filter: ANSI and CR stripped, IPv4 anonymised, noise and blank lines dropped
+_tm_clean_log() {
+  sed -E -e 's/\r$//' -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\\(033|e)\[[0-9;?]*[a-zA-Z]//g' \
+    -e 's/\b([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b/\1.x.x.x/g' |
+    grep -avE "$_TM_NOISE_RE" | grep -avE '^[[:space:]]*$' || true
+}
+
+# stdin filter: from the last [INFO] or [OK] log line on - the step that failed
+_tm_step_output() {
+  awk '/^\[[0-9-]+ [0-9:]+\] \[(INFO|OK)\] /{n=0} {buf[n++]=$0} END{for(i=0;i<n;i++)print buf[i]}'
+}
+
+# stdin filter: what goes into the trace. The error is at the end; a Node crash
+# prints its minified source line, which alone filled the budget.
+_tm_focus() {
+  _tm_step_output | _tm_clean_log | cut -c1-1000 | tail -n "${TELEMETRY_ERROR_MAX_LINES:-60}" | tail -c "${TELEMETRY_ERROR_MAX_BYTES:-10240}"
+}
+
+# The most specific log that exists: combined (host + container), install, build.
+_tm_pick_logfile() {
+  local candidate
+  for candidate in \
+    "${combined_log:-}" \
+    "/tmp/install-${SESSION_ID:-}-combined.log" \
+    "/tmp/${NSAPP:-lxc}-${CTID:-}-${SESSION_ID:-}.log" \
+    "${INSTALL_LOG:-}" \
+    "${BUILD_LOG:-}" \
+    "${SILENT_LOGFILE:-}"; do
+    if [[ -n "$candidate" && -s "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# get_error_log - the failing step's output from the active log, when there is no capture
+get_error_log() {
+  local logfile
+  if declare -f ensure_log_on_host >/dev/null 2>&1; then
+    ensure_log_on_host 2>/dev/null || true
+  fi
+  logfile=$(_tm_pick_logfile)
+  [[ -z "$logfile" || ! -s "$logfile" ]] && return 0
+  _tm_focus <"$logfile"
+}
+
+# The capture for this failure: the container's (pulled by the host), else this side's.
+_tm_find_errinfo() {
+  local candidate
+  for candidate in \
+    "${TELEMETRY_ERRINFO:-}" \
+    "/tmp/.errinfo-${SESSION_ID:-none}" \
+    "${BUILD_LOG:-/nonexistent}.errinfo" \
+    "${INSTALL_LOG:-/nonexistent}.errinfo"; do
+    if [[ -n "$candidate" && -s "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Tool-aware explanation when the error handler is loaded (it knows which tool ran).
+_tm_explain() {
+  if [[ -n "${2:-}" ]] && declare -f _eh_explanation >/dev/null 2>&1; then
+    _eh_explanation "$1" "$2"
+  else
+    explain_exit_code "$1"
+  fi
+}
+
+# The VM engine's colors are the text \033[...m until printf %b turns them into
+# escapes, so a step or message that holds one carries the text.
+_tm_one_line() {
+  printf '%s' "$1" | tr '\n\t' '  ' | sed -E 's/\\(033|e)\[[0-9;?]*[a-zA-Z]//g; s/\x1b\[[0-9;?]*[a-zA-Z]//g; s/ +/ /g; s/^ //; s/ $//' | head -c "${2:-300}"
+}
+
+# ------------------------------------------------------------------------------
+# _tm_error_context <exit_code>
+#
+# Sets TM_ERR_{CODE,COMMAND,LINE,FUNCTION,STEP,MESSAGE,PHASE,OUTPUT,EXPLANATION}
+# in the calling shell. A capture counts only when its code matches the one
+# being reported (or that code is the generic 1/255 bash passes up); otherwise
+# it belongs to an earlier failure.
+# ------------------------------------------------------------------------------
+_tm_error_context() {
+  local exit_code="${1:-1}" errinfo="" captured=""
+
+  TM_ERR_CODE="$exit_code"
+  TM_ERR_COMMAND="${FAILED_COMMAND:-}"
+  TM_ERR_LINE="${FAILED_LINE:-}"
+  TM_ERR_FUNCTION="${FAILED_FUNCTION:-}"
+  TM_ERR_STEP="${CS_STEP:-${CS_STEP_DONE:+after ${CS_STEP_DONE}}}"
+  TM_ERR_MESSAGE="${CS_ERROR_MSG:-}"
+  TM_ERR_PHASE="host"
+  TM_ERR_OUTPUT=""
+
+  if errinfo=$(_tm_find_errinfo); then
+    captured=$(sed -n 's/^EXIT_CODE=//p' "$errinfo" | head -n1)
+    if [[ -n "$captured" && ("$captured" == "$exit_code" || "$exit_code" == "1" || "$exit_code" == "255") ]]; then
+      TM_ERR_CODE="$captured"
+      TM_ERR_LINE=$(sed -n 's/^LINE=//p' "$errinfo" | head -n1)
+      TM_ERR_COMMAND=$(sed -n 's/^COMMAND=//p' "$errinfo" | head -n1)
+      TM_ERR_FUNCTION=$(sed -n 's/^FUNCTION=//p' "$errinfo" | head -n1)
+      local phase v
+      phase=$(sed -n 's/^PHASE=//p' "$errinfo" | head -n1)
+      [[ -z "$phase" && "$errinfo" == "/tmp/.errinfo-${SESSION_ID:-none}" ]] && phase="container"
+      if [[ "$phase" == "container" ]]; then
+        # The host's own message ("Installation failed in container ...") says nothing the container did not.
+        TM_ERR_PHASE="container"
+        TM_ERR_STEP=$(sed -n 's/^STEP=//p' "$errinfo" | head -n1)
+        TM_ERR_MESSAGE=$(sed -n 's/^MESSAGE=//p' "$errinfo" | head -n1)
+      else
+        v=$(sed -n 's/^STEP=//p' "$errinfo" | head -n1)
+        [[ -n "$v" ]] && TM_ERR_STEP="$v"
+        v=$(sed -n 's/^MESSAGE=//p' "$errinfo" | head -n1)
+        [[ -n "$v" ]] && TM_ERR_MESSAGE="$v"
+      fi
+      TM_ERR_OUTPUT=$(awk 'f{print} /^--- OUTPUT ---$/{f=1}' "$errinfo" | _tm_focus)
+    fi
+  fi
+
+  [[ -z "$TM_ERR_OUTPUT" ]] && TM_ERR_OUTPUT=$(get_error_log)
+  [[ "$TM_ERR_LINE" =~ ^[0-9]+$ ]] || TM_ERR_LINE=""
+  [[ "$TM_ERR_COMMAND" == "unknown" ]] && TM_ERR_COMMAND=""
+  [[ "$TM_ERR_FUNCTION" == "main" ]] && TM_ERR_FUNCTION=""
+
+  TM_ERR_COMMAND=$(_tm_one_line "$TM_ERR_COMMAND" 300)
+  TM_ERR_STEP=$(_tm_one_line "$TM_ERR_STEP" 120)
+  TM_ERR_MESSAGE=$(_tm_one_line "$TM_ERR_MESSAGE" 300 | sed -E 's/\b([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b/\1.x.x.x/g')
+  TM_ERR_EXPLANATION=$(_tm_explain "$TM_ERR_CODE" "$TM_ERR_COMMAND")
+}
+
+# _tm_format_error - the trace from TM_ERR_* (see _tm_error_context)
+#
+#   exit_code=N | <explanation>[ | step: S][ | in F][ | at line L: C]
+#   ---
+#   <output of the failing step>
+_tm_format_error() {
+  local header="exit_code=${TM_ERR_CODE} | ${TM_ERR_EXPLANATION}"
+  [[ -n "$TM_ERR_STEP" ]] && header+=" | step: ${TM_ERR_STEP}"
+  [[ -n "$TM_ERR_FUNCTION" ]] && header+=" | in ${TM_ERR_FUNCTION}"
+  if [[ -n "$TM_ERR_COMMAND" && -n "$TM_ERR_LINE" ]]; then
+    header+=" | at line ${TM_ERR_LINE}: ${TM_ERR_COMMAND}"
+  elif [[ -n "$TM_ERR_COMMAND" ]]; then
+    header+=" | command: ${TM_ERR_COMMAND}"
+  fi
+
+  if [[ -n "$TM_ERR_OUTPUT" ]]; then
+    printf '%s
+---
+%s' "$header" "$TM_ERR_OUTPUT"
+  else
+    printf '%s' "$header"
+  fi
+}
+
+# build_error_string <exit_code>
+build_error_string() {
+  _tm_error_context "${1:-1}"
+  _tm_format_error
+}

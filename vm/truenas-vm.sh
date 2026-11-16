@@ -6,7 +6,7 @@
 # Source: https://www.truenas.com/truenas-community-edition/
 
 COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local}"
-source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/core/main}/pve/vm-core.func")
+source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}/pve/vm-core.func")
 load_functions
 
 GEN_MAC=02:$(openssl rand -hex 5 | awk '{print toupper($0)}' | sed 's/\(..\)/\1:/g; s/.$//')
@@ -184,7 +184,7 @@ vm_fetch_image "$FULL_URL" "$CACHE_FILE" --cache --min-bytes "$MIN_ISO_BYTES" ||
 set -o pipefail
 msg_info "Creating TrueNAS VM shell"
 qm create "$VMID"${MACHINE} -bios ovmf -agent enabled=1 -tablet 0 -localtime 1${CPU_TYPE} \
-  -cores "$CORE_COUNT" -memory "$RAM_SIZE" -balloon 0 -name "$HN" -tags community-script \
+  -cores "$CORE_COUNT" -memory "$RAM_SIZE" -balloon 0 -name "$HN" -tags community-script-local \
   -net0 "virtio,bridge=$BRG,macaddr=$MAC$VLAN$MTU" -onboot 1 -ostype l26 \
   -efidisk0 $STORAGE:1,efitype=4m,pre-enrolled-keys=0 -sata0 ${STORAGE}:${DISK_SIZE%G},${DISK_CACHE}ssd=1 \
   -scsihw virtio-scsi-single -cdrom "$ISO_VOLUME" -boot order='sata0;ide2' -vga virtio >/dev/null

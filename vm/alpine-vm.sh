@@ -6,7 +6,7 @@
 # Source: https://alpinelinux.org/cloud/
 
 COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local}"
-source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/core/main}/pve/vm-core.func")
+source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}/pve/vm-core.func")
 load_functions
 
 APP="Alpine"
@@ -141,7 +141,7 @@ fi
 
 msg_info "Creating an Alpine VM"
 qm create "$VMID" -agent 1${MACHINE} -tablet 0 -localtime 1 -bios ovmf${CPU_TYPE} -cores "$CORE_COUNT" -memory "$RAM_SIZE" \
-  -name "$HN" -tags community-script -net0 virtio,bridge="$BRG",macaddr="$MAC""$VLAN""$MTU" -onboot 1 -ostype l26 -scsihw virtio-scsi-pci
+  -name "$HN" -tags community-script-local -net0 virtio,bridge="$BRG",macaddr="$MAC""$VLAN""$MTU" -onboot 1 -ostype l26 -scsihw virtio-scsi-pci
 pvesm alloc "$STORAGE" "$VMID" "$DISK0" 4M 1>&/dev/null
 pvesm alloc "$STORAGE" "$VMID" "$DISK2" 4M 1>&/dev/null
 qm importdisk "$VMID" "$WORK_FILE" "$STORAGE" -format "$DISK_IMPORT_FORMAT" 1>&/dev/null

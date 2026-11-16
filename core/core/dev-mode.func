@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# Copyright (c) 2021-2026 community-scripts ORG
+# License: MIT | https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core/LICENSE
+
+# ==============================================================================
+# DEV-MODE.FUNC - DEVELOPER AND DEBUGGING MODES
+# ==============================================================================
+# Opt-in debugging, driven by a comma-separated dev_mode variable:
+#
+#   net         log every engine fetch: HTTP status, duration, URL
+#   timing      show how long each step took, and the slowest ones at the end
+#   trace       bash set -x tracing
+#   pause       wait for a keypress after each step
+#   keep        never delete the container when a build fails
+#   breakpoint  open a shell on error instead of cleaning up
+#   motd        set up MOTD/SSH early so a kept container can be inspected
+#   logs        persist all logs to /var/log/community-scripts/
+#
+# Any of them also prints the resolved context up front: where the engine came
+# from, which roots and URLs are in play, and what the host looks like.
+#
+# Parsing, the context block and the timing bookkeeping live here. The flags
+# themselves are read at the point of use, in the backends and the messaging
+# helpers -- except net, which build.func reads straight from $dev_mode,
+# because the fetches worth seeing happen before this file is even loaded.
+# ==============================================================================
+
+[[ -n "${_DEV_MODE_FUNC_LOADED:-}" ]] && return
+_DEV_MODE_FUNC_LOADED=1
+
+_DEV_MODE_FLAGS=(net timing trace pause keep breakpoint motd logs)
+
+# ------------------------------------------------------------------------------
+# parse_dev_mode()
+#
+# - Parses the comma-separated dev_mode variable (e.g. "net,timing")
+# - Exports one DEV_MODE_<FLAG> per known flag, true or false
+# - Names the known flags when one is unrecognised: a typo would otherwise be
+#   indistinguishable from a mode that simply does nothing
+# ------------------------------------------------------------------------------
+parse_dev_mode() {
+  local flag mode
+  for flag in "${_DEV_MODE_FLAGS[@]}"; do
+    export "DEV_MODE_${flag^^}=false"
+  done
+
+  # dev_mode set without naming flags means "ask me": the picker opens before
+  # the install menu. dev_mode=net,timing skips it and goes straight in.
+  _DEV_MODE_ASK=0
+  if [[ -n "${dev_mode+x}" ]]; then
+    case "${dev_mode,,}" in
+    "" | 1 | yes | true | ask | menu)
+      _DEV_MODE_ASK=1
+      export _DEV_MODE_ASK
+      return 0
+      ;;
+    esac
+  fi
+  export _DEV_MODE_ASK
+
+  [[ -z "${dev_mode:-}" ]] && return 0
+
+  local active=()
+  IFS=',' read -ra _dev_modes <<<"$dev_mode"
+  for mode in "${_dev_modes[@]}"; do
+    mode="${mode//[[:space:]]/}"
+    [[ -z "$mode" ]] && continue
+    if [[ " ${_DEV_MODE_FLAGS[*]} " == *" $mode "* ]]; then
+      export "DEV_MODE_${mode^^}=true"
+      active+=("$mode")
+    else
+      if declare -f msg_warn >/dev/null 2>&1; then
+        msg_warn "Unknown dev_mode '$mode' — known: ${_DEV_MODE_FLAGS[*]}"
+      else
+        echo "[WARN] Unknown dev_mode '$mode' — known: ${_DEV_MODE_FLAGS[*]}" >&2
+      fi
+    fi
+  done
+
+  ((${#active[@]})) || return 0
+  if declare -f msg_custom >/dev/null 2>&1; then
+    msg_custom "🔧" "${YWB:-}" "Dev mode: ${active[*]}"
+  else
+    echo "[DEV] ${active[*]}" >&2
+  fi
+  dev_mode_context
+}
+
+# ------------------------------------------------------------------------------
+# dev_mode_context()
+#
+# - Prints where the engine and the scripts were resolved from, and the host
+#   facts every other flag's output has to be read against
+# ------------------------------------------------------------------------------
+dev_mode_context() {
+  local engine="network (${COMMUNITY_SCRIPTS_CORE_URL:-unset})"
+  if [[ -n "${COMMUNITY_SCRIPTS_CORE_DIR:-}" ]]; then
+    case "$COMMUNITY_SCRIPTS_CORE_DIR" in
+    */cs-engine.*) engine="prefetched → ${COMMUNITY_SCRIPTS_CORE_DIR}" ;;
+    *) engine="local checkout → ${COMMUNITY_SCRIPTS_CORE_DIR}" ;;
+    esac
+  fi
+
+  {
+    echo "  ── dev context ─────────────────────────────────────────────"
+    printf '  %-14s %s\n' "engine" "$engine"
+    printf '  %-14s %s\n' "engine url" "${COMMUNITY_SCRIPTS_CORE_URL:-unset}"
+    printf '  %-14s %s\n' "scripts root" "${COMMUNITY_SCRIPTS_ROOT:-none (remote)}"
+    printf '  %-14s %s\n' "scripts url" "${COMMUNITY_SCRIPTS_URL:-unset}"
+    printf '  %-14s %s\n' "app" "${APP:-?} (${NSAPP:-?}, type ${APP_TYPE:-?})"
+    printf '  %-14s %s\n' "platform" "$(declare -f detect_lxc_platform >/dev/null 2>&1 && detect_lxc_platform || echo unknown)"
+    printf '  %-14s %s\n' "arch" "$(dpkg --print-architecture 2>/dev/null || uname -m)"
+    if command -v pveversion >/dev/null 2>&1; then
+      printf '  %-14s %s\n' "pve" "$(declare -f _pve_version >/dev/null 2>&1 && _pve_version || pveversion)"
+    fi
+    printf '  %-14s %s\n' "bash" "${BASH_VERSION%%(*}"
+    printf '  %-14s %s\n' "curl" "$(curl --version 2>/dev/null | head -1 | awk '{print $2}' || echo absent)"
+    printf '  %-14s %s\n' "session" "${SESSION_ID:-none}"
+    echo "  ────────────────────────────────────────────────────────────"
+  } >&2
+}
+
+# ------------------------------------------------------------------------------
+# _dev_step_start() / _dev_step_end()
+#
+# - Called from msg_info and msg_ok; no-ops unless dev_mode=timing
+# - _dev_step_end returns a suffix for the msg_ok line, so the elapsed time
+#   lands on the step it belongs to instead of in a separate stream
+# - State goes in a file: msg_ok is often reached inside $( ), where a variable
+#   assignment would be discarded on return
+# ------------------------------------------------------------------------------
+_dev_timing_dir() {
+  local base d
+  for base in /dev/shm "${TMPDIR:-/tmp}" /tmp; do
+    [[ -d "$base" ]] || continue
+    d="${base}/cs-timing.$$"
+    # -w can pass where the write still fails, so probe for real.
+    mkdir -p "$d" 2>/dev/null || continue
+    { : >"${d}/.probe"; } 2>/dev/null || continue
+    printf '%s' "$d"
+    return 0
+  done
+  return 1
+}
+
+# Pure bash, no subshell: a timer that forks sed and awk on every step reports
+# its own overhead as the step's cost. Measured, that was ~180 ms per step.
+_dev_step_key() {
+  local k="${1//[^a-zA-Z0-9]/_}"
+  printf '%s' "${k:0:60}"
+}
+
+_dev_step_start() {
+  [[ "${DEV_MODE_TIMING:-false}" == "true" ]] || return 0
+  local d
+  d="$(_dev_timing_dir)" || return 0
+  printf '%s' "${EPOCHREALTIME/[.,]/}" >"${d}/s.$(_dev_step_key "$1")" 2>/dev/null
+}
+
+_dev_step_end() {
+  [[ "${DEV_MODE_TIMING:-false}" == "true" ]] || return 0
+  local d key start ms
+  d="$(_dev_timing_dir)" || return 0
+  key="$(_dev_step_key "$1")"
+  [[ -s "${d}/s.${key}" ]] || return 0
+  read -r start <"${d}/s.${key}"
+  rm -f "${d}/s.${key}"
+  ms=$(((${EPOCHREALTIME/[.,]/} - start) / 1000))
+  printf '%s %s
+' "$ms" "$key" >>"${d}/done"
+  printf ' %s(%s ms)%s' "${DGN:-}" "$ms" "${CL:-}"
+}
+
+# ------------------------------------------------------------------------------
+# dev_mode_timing_summary()
+#
+# - Prints the slowest steps of the run; called from the exit path
+# ------------------------------------------------------------------------------
+dev_mode_timing_summary() {
+  [[ "${DEV_MODE_TIMING:-false}" == "true" ]] || return 0
+  local d
+  d="$(_dev_timing_dir)" || return 0
+  if [[ ! -s "${d}/done" ]]; then
+    rm -rf "$d" 2>/dev/null
+    return 0
+  fi
+  {
+    echo "  ── slowest steps ───────────────────────────────────────────"
+    sort -rn "${d}/done" | head -10 | while read -r ms key; do
+      printf '  %8s ms  %s
+' "$ms" "$key"
+    done
+    echo "  ────────────────────────────────────────────────────────────"
+  } >&2
+  rm -rf "$d" 2>/dev/null
+}
+
+# ------------------------------------------------------------------------------
+# dev_mode_menu()
+#
+# - Whiptail picker for the same flags, plus verbose
+# ------------------------------------------------------------------------------
+dev_mode_menu() {
+  local flag state items=() selection
+  local -A labels=(
+    [net]="Log every engine fetch"
+    [timing]="Time each step"
+    [trace]="Bash command tracing"
+    [pause]="Step-by-step execution"
+    [keep]="Preserve container on failure"
+    [breakpoint]="Interactive shell on error"
+    [motd]="Early SSH/MOTD setup"
+    [logs]="Persistent logging"
+  )
+  for flag in "${_DEV_MODE_FLAGS[@]}"; do
+    state=OFF
+    [[ ",${dev_mode:-}," == *",${flag},"* ]] && state=ON
+    items+=("$flag" "${labels[$flag]}" "$state")
+  done
+  items+=("verbose" "Verbose logging" "$([[ "${var_verbose:-no}" == "yes" ]] && echo ON || echo OFF)")
+
+  selection=$(whiptail --backtitle "Proxmox VE Helper Scripts" \
+    --title "DEV MODE" \
+    --checklist "Choose one or more options" 17 56 10 \
+    "${items[@]}" \
+    3>&1 1>&2 2>&3) || exit_script
+
+  dev_mode=""
+  var_verbose="no"
+  local picked=() tag
+  for tag in $selection; do
+    tag="${tag%\"}"
+    tag="${tag#\"}"
+    if [[ "$tag" == "verbose" ]]; then
+      var_verbose="yes"
+    else
+      picked+=("$tag")
+    fi
+  done
+  dev_mode="$(
+    IFS=,
+    echo "${picked[*]}"
+  )"
+  export dev_mode
+
+  _DEV_MODE_ASK=0
+  parse_dev_mode
+  if [[ "${DEV_MODE_LOGS:-false}" == "true" ]]; then
+    mkdir -p /var/log/community-scripts
+    BUILD_LOG="/var/log/community-scripts/create-lxc-${SESSION_ID}-$(date +%Y%m%d_%H%M%S).log"
+    combined_log="/var/log/community-scripts/install-${SESSION_ID}-combined-$(date +%Y%m%d_%H%M%S).log"
+  fi
+}

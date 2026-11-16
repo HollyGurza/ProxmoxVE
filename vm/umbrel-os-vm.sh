@@ -5,7 +5,7 @@
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 
 COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local}"
-source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/core/main}/pve/vm-core.func")
+source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}/pve/vm-core.func")
 load_functions
 
 GEN_MAC=02:$(openssl rand -hex 5 | awk '{print toupper($0)}' | sed 's/\(..\)/\1:/g; s/.$//')
@@ -109,7 +109,7 @@ msg_info "Creating a Umbrel OS VM"
 # Umbrel requires EFI: the installer ISO has no legacy boot path. Its own
 # console runs on tty1, so this VM is driven through noVNC, not the serial line.
 qm create "$VMID"${MACHINE} -bios ovmf -agent enabled=1 -tablet 0 -localtime 1 ${CPU_TYPE} \
-  -cores "$CORE_COUNT" -memory "$RAM_SIZE" -name "$HN" -tags community-script \
+  -cores "$CORE_COUNT" -memory "$RAM_SIZE" -name "$HN" -tags community-script-local \
   -net0 "virtio,bridge=$BRG,macaddr=$MAC$VLAN$MTU" -onboot 1 -ostype l26 -scsihw virtio-scsi-pci \
   -efidisk0 "${STORAGE}:1,efitype=4m,pre-enrolled-keys=0" \
   -scsi0 "${STORAGE}:${DISK_SIZE%G},${DISK_CACHE:-}${THIN%,}" \

@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+# Copyright (c) 2021-2026 community-scripts ORG
+# License: MIT | https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core/LICENSE
+
+# ==============================================================================
+# API/TELEMETRY TRANSPORT
+# ==============================================================================
+# Payload and delivery. Loaded through api/api.func. Every send is best-effort:
+# telemetry must never be the reason a run fails.
+# ==============================================================================
+
+[[ -n "${_API_TELEMETRY_LOADED:-}" ]] && return 0
+_API_TELEMETRY_LOADED=1
+
+# DIAGNOSTICS as the caller's environment had it, before variables() or a read
+# of the diagnostics file replaces it. Only devscripts_telemetry() reads it.
+_TM_DIAGNOSTICS_ENV="${DIAGNOSTICS-}"
+
+# ------------------------------------------------------------------------------
+# devscripts_telemetry
+#
+# DevScripts are testing builds, and their telemetry is what decides whether a
+# script moves on to ProxmoxVE or its issue goes stale. So a DevScripts run
+# always reports, whatever the diagnostics file says. The file is left alone:
+# ProxmoxVE runs keep the user's own choice.
+#
+# The one way out is DIAGNOSTICS=no in the environment the run was started
+# with. The CI test runs set it, so their builds stay out of the numbers.
+#
+# The notice is shown once per host. Interactively it is a dialog that can be
+# declined, which ends the run; accepting it is remembered. Unattended (no TTY,
+# PHS_SILENT, a non-interactive mode) nothing can be asked, so the notice is
+# printed on every run until someone has accepted the dialog. It never blocks.
+#
+# Returns 1 when this is not a DevScripts run, so the caller keeps its own
+# DIAGNOSTICS handling. Otherwise sets and exports DIAGNOSTICS and returns 0.
+# ------------------------------------------------------------------------------
+devscripts_telemetry() {
+  # HollyGurza/ProxmoxVE local fork: telemetry is removed, nothing is ever sent.
+  DIAGNOSTICS="no"
+  export DIAGNOSTICS
+  return 1
+}
+
+# curl present, opted in, session id set
+_tm_enabled() {
+  # HollyGurza/ProxmoxVE local fork: telemetry is removed, nothing is ever sent.
+  return 1
+}
+
+# ------------------------------------------------------------------------------
+# _tm_payload <status> [exit_code] [error_trace]
+#
+# The full record. Every send carries all metadata, whichever event the server
+# keeps. The error_* fields come from TM_ERR_* (_tm_error_context) and are only
+# sent with a trace.
+# ------------------------------------------------------------------------------
+_tm_payload() {
+  local status="$1"
+  local exit_code="${2:-0}"
+  local error_raw="${3:-}"
+
+  telemetry_collect_sysinfo
+
+  [[ ! "$exit_code" =~ ^[0-9]+$ ]] && exit_code=199
+  ((exit_code > 255)) && exit_code=255
+
+  local disk_size="${DISK_SIZE:-0}"
+  disk_size="${disk_size%G}"
+  [[ ! "$disk_size" =~ ^[0-9]+$ ]] && disk_size=0
+
+  local duration=0
+  if [[ -n "${INSTALL_START_TIME:-}" ]]; then
+    duration=$(($(date +%s) - INSTALL_START_TIME))
+    ((duration < 0)) && duration=0
+    ((duration > 86400)) && duration=86400
+  fi
+
+  local error_json="" error_category="" error_message="" error_step="" error_phase="" failed_function=""
+  local failed_command="" failed_line=0
+  if [[ -n "$error_raw" ]]; then
+    error_json=$(json_escape "$error_raw")
+    error_category=$(categorize_error "$exit_code" "${TM_ERR_COMMAND:-${FAILED_COMMAND:-}}")
+    error_step=$(json_escape "${TM_ERR_STEP:-}")
+    if [[ "$status" != "aborted" ]]; then
+      error_message=$(json_escape "${TM_ERR_MESSAGE:-}")
+      error_phase="${TM_ERR_PHASE:-}"
+      failed_function=$(json_escape "${TM_ERR_FUNCTION:-}")
+      failed_command=$(json_escape "${TM_ERR_COMMAND:-${FAILED_COMMAND:-}}")
+      failed_line="${TM_ERR_LINE:-${FAILED_LINE:-0}}"
+    fi
+  fi
+  [[ ! "$failed_line" =~ ^[0-9]+$ ]] && failed_line=0
+
+  local gpu_model cpu_model
+  gpu_model=$(json_escape "${GPU_MODEL:-}")
+  cpu_model=$(json_escape "${CPU_MODEL:-}")
+
+  # Whether the devices reached the guest; the host's hardware is in gpu_vendor/gpu_model.
+  local gpu_passthrough="no"
+  [[ "${var_gpu:-no}" == "yes" || "${ENABLE_GPU:-no}" == "yes" ]] && gpu_passthrough="yes"
+
+  local app_version kernel_version
+  app_version=$(json_escape "${APPLICATION_VERSION:-${var_appversion:-}}")
+  kernel_version=$(json_escape "${KERNEL_VERSION:-}")
+
+  cat <<EOF
+{
+    "payload_version": ${TELEMETRY_PAYLOAD_VERSION},
+    "random_id": "${RANDOM_UUID}",
+    "execution_id": "${EXECUTION_ID:-${RANDOM_UUID}}",
+    "type": "${TELEMETRY_TYPE:-lxc}",
+    "nsapp": "${NSAPP:-${app:-unknown}}",
+    "status": "${status}",
+    "ct_type": ${CT_TYPE:-1},
+    "disk_size": ${disk_size},
+    "core_count": ${CORE_COUNT:-0},
+    "ram_size": ${RAM_SIZE:-0},
+    "os_type": "${var_os:-}",
+    "os_version": "${var_version:-}",
+    "pve_version": "${TM_PVE_VERSION:-}",
+    "method": "${METHOD:-default}",
+    "exit_code": ${exit_code},
+    "error": "${error_json}",
+    "error_category": "${error_category}",
+    "error_message": "${error_message}",
+    "error_step": "${error_step}",
+    "error_phase": "${error_phase}",
+    "install_duration": ${duration},
+    "cpu_vendor": "${CPU_VENDOR:-unknown}",
+    "cpu_model": "${cpu_model}",
+    "gpu_vendor": "${GPU_VENDOR:-unknown}",
+    "gpu_model": "${gpu_model}",
+    "gpu_passthrough": "${gpu_passthrough}",
+    "ram_speed": "${RAM_SPEED:-}",
+    "arch": "${TM_ARCH:-}",
+    "platform": "${TM_PLATFORM:-}",
+    "has_arm": ${HAS_ARM:-false},
+    "kernel_version": "${kernel_version}",
+    "app_version": "${app_version}",
+    "failed_command": "${failed_command}",
+    "failed_line": ${failed_line},
+    "failed_function": "${failed_function}",
+    "repo_source": "${REPO_SOURCE}",
+    "repo_slug": "${REPO_SLUG:-}"
+}
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# _tm_send <payload> [timeout] [attempts] - 0 on HTTP 2xx, 1 otherwise, never raises
+# ------------------------------------------------------------------------------
+_tm_send() {
+  # HollyGurza/ProxmoxVE local fork: telemetry is removed, nothing is ever sent.
+  return 1
+}
+
+# ==============================================================================
+# PUBLIC API
+# ==============================================================================
+
+# _tm_quiet <function> [args] - a sender with errexit and the caller's ERR trap
+# off. A failing command in here would otherwise re-enter the error handler,
+# which reports again.
+_tm_quiet() {
+  local - err_trap rc=0
+  err_trap="$(trap -p ERR)"
+  set +eE +o pipefail
+  trap - ERR
+  "$@" || rc=$?
+  [[ -n "$err_trap" ]] && eval "$err_trap"
+  return "$rc"
+}
+
+post_to_api() { _tm_quiet _tm_post_install "$@"; }
+post_progress_to_api() { _tm_quiet _tm_post_progress "$@"; }
+post_update_to_api() { _tm_quiet _tm_post_update "$@"; }
+
+# post_to_api - the "installing" record; once per execution, retried 3x
+_tm_post_install() {
+  [[ "${POST_TO_API_DONE:-}" == "true" ]] && return 0
+  _tm_enabled || return 0
+
+  TELEMETRY_TYPE="${TELEMETRY_TYPE:-lxc}"
+
+  # The clock starts at the first report, so storage, template and create count too.
+  [[ -z "${INSTALL_START_TIME:-}" ]] && export INSTALL_START_TIME="$(date +%s)"
+
+  local payload
+  payload=$(_tm_payload "installing")
+
+  if _tm_send "$payload" "$TELEMETRY_TIMEOUT" 3; then
+    POST_TO_API_DONE=true
+  else
+    POST_TO_API_DONE=false
+  fi
+}
+
+# post_to_api_vm - same for a VM; reads the opt-in itself since no container set it
+post_to_api_vm() {
+  [[ "${POST_TO_API_DONE:-}" == "true" ]] && return 0
+
+  if [[ -f /usr/local/community-scripts/diagnostics ]]; then
+    DIAGNOSTICS=$(grep -i "^DIAGNOSTICS=" /usr/local/community-scripts/diagnostics 2>/dev/null | awk -F'=' '{print $2}') || true
+  fi
+  devscripts_telemetry || true
+
+  TELEMETRY_TYPE="vm"
+  CT_TYPE=2
+  post_to_api
+}
+
+# post_progress_to_api [status] - "validation"/"configuring" ping, full payload, one attempt
+_tm_post_progress() {
+  _tm_enabled || return 0
+
+  local progress_status="${1:-configuring}"
+  local payload
+  payload=$(_tm_payload "$progress_status")
+  _tm_send "$payload" "$TELEMETRY_TIMEOUT" 1 || true
+}
+
+# ------------------------------------------------------------------------------
+# post_update_to_api <status> <exit_code> [force]
+#
+# The terminal status, exactly once per execution ("force" reports again when
+# the outcome changed, e.g. a retry succeeded). status: done|success, failed,
+# aborted. exit_code "none" means 0; anything else non-numeric becomes 199.
+# ------------------------------------------------------------------------------
+_tm_post_update() {
+  command -v curl &>/dev/null || return 0
+
+  local status="${1:-failed}"
+  local raw_exit_code="${2-}"
+  local force="${3:-}"
+
+  POST_UPDATE_DONE=${POST_UPDATE_DONE:-false}
+  if [[ "$POST_UPDATE_DONE" == "true" && "$force" != "force" ]]; then
+    return 0
+  fi
+
+  [[ "${DIAGNOSTICS:-no}" == "no" ]] && return 0
+  [[ -z "${RANDOM_UUID:-}" ]] && return 0
+
+  local exit_code=0
+  if [[ "$raw_exit_code" =~ ^[0-9]+$ ]]; then
+    exit_code="$raw_exit_code"
+  elif [[ "$raw_exit_code" != "none" ]]; then
+    exit_code=199
+  fi
+
+  local pb_status error_raw=""
+  case "$status" in
+  done | success)
+    pb_status="success"
+    exit_code=0
+    ;;
+  aborted)
+    pb_status="aborted"
+    ;;
+  failed)
+    # The engine asking a question and being told no, and signals: user decisions, not failures.
+    case "$exit_code" in
+    113 | 114 | 122 | 129 | 130 | 143 | 253 | 254) pb_status="aborted" ;;
+    *) pb_status="failed" ;;
+    esac
+    ;;
+  *)
+    pb_status="unknown"
+    ;;
+  esac
+
+  # Unset: the run ended before its build reported the install, in the checks
+  # or a dialog. Those report nothing; a host that is not ready is no failed
+  # install. "false" means the install was due and its send failed.
+  [[ -z "${POST_TO_API_DONE:-}" ]] && return 0
+
+  if [[ "$pb_status" == "failed" || "$pb_status" == "unknown" ]]; then
+    _tm_error_context "$exit_code"
+    exit_code="$TM_ERR_CODE"
+    error_raw=$(_tm_format_error)
+  elif [[ "$pb_status" == "aborted" ]]; then
+    TM_ERR_STEP="${CS_STEP:-${CS_STEP_DONE:+after ${CS_STEP_DONE}}}"
+    TM_ERR_COMMAND=""
+    error_raw="exit_code=${exit_code} | $(explain_exit_code "$exit_code")${TM_ERR_STEP:+ | step: ${TM_ERR_STEP}}"
+    ERROR_CATEGORY_OVERRIDE="${ERROR_CATEGORY_OVERRIDE:-user_aborted}"
+  fi
+
+  local payload
+  payload=$(_tm_payload "$pb_status" "$exit_code" "$error_raw")
+
+  if _tm_send "$payload" "$STATUS_TIMEOUT" 2; then
+    POST_UPDATE_DONE=true
+    return 0
+  fi
+
+  # The payload itself may be the problem: retry with the header line only.
+  if [[ -n "$error_raw" ]]; then
+    payload=$(_tm_payload "$pb_status" "$exit_code" "$(head -n1 <<<"$error_raw" | head -c 600)")
+    if _tm_send "$payload" "$STATUS_TIMEOUT" 2; then
+      POST_UPDATE_DONE=true
+      return 0
+    fi
+  fi
+
+  # Left false so the EXIT trap can try once more.
+  return 0
+}
+
+# Tools and add-ons have no build step that starts their telemetry, so their
+# checks are known by the code they exit with: wrong host or OS, nothing to work
+# on, a prerequisite missing. Like the checks before a container build, those
+# report nothing.
+_tm_requirement_code() {
+  case "$1" in
+  10 | 103 | 104 | 106 | 232 | 233 | 234 | 236 | 238) return 0 ;;
+  esac
+  return 1
+}
+
+# ------------------------------------------------------------------------------
+# _tm_post_run <type> <name> <status> <exit_code> [reason] - tool and add-on runs
+#
+# Each run is its own execution with a fresh id. Failures carry the same error
+# fields as installs; an abort carries its reason.
+# ------------------------------------------------------------------------------
+_tm_post_run() {
+  command -v curl &>/dev/null || return 0
+  [[ "${DIAGNOSTICS:-no}" == "no" ]] && return 0
+
+  local type="$1" name="${2:-unknown}" status="${3:-success}" exit_code="${4:-0}" reason="${5:-}"
+  local uuid error_raw="" category="${ERROR_CATEGORY_OVERRIDE:-}" payload
+
+  uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "${type}-$(date +%s)")
+  [[ "$status" == "done" ]] && status="success"
+  [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code=199
+  [[ "$status" == "failed" ]] && _tm_requirement_code "$exit_code" && return 0
+
+  if [[ "$status" == "failed" ]]; then
+    _tm_error_context "$exit_code"
+    exit_code="$TM_ERR_CODE"
+    error_raw=$(_tm_format_error)
+  elif [[ "$status" == "aborted" ]]; then
+    TM_ERR_STEP="${CS_STEP:-${CS_STEP_DONE:+after ${CS_STEP_DONE}}}"
+    error_raw="exit_code=${exit_code} | ${reason:-$(explain_exit_code "$exit_code")}${TM_ERR_STEP:+ | step: ${TM_ERR_STEP}}"
+    category="${category:-user_aborted}"
+  fi
+
+  payload=$(RANDOM_UUID="$uuid" EXECUTION_ID="$uuid" TELEMETRY_TYPE="$type" NSAPP="$name" CT_TYPE=0 \
+    ERROR_CATEGORY_OVERRIDE="$category" _tm_payload "$status" "$exit_code" "$error_raw")
+  _tm_send "$payload" "$TELEMETRY_TIMEOUT" 1 || true
+}
+
+# post_tool_to_api <name> [status] [exit_code] [reason] - a PVE host tool ran
+post_tool_to_api() {
+  _tm_quiet _tm_post_run "${TELEMETRY_TOOL_TYPE:-pve}" "$@"
+}
+
+# post_addon_to_api <name> [status] [exit_code] [reason] - an add-on ran inside a container
+post_addon_to_api() {
+  local os_type="" os_version=""
+  if [[ -f /etc/os-release ]]; then
+    os_type=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"' || true)
+    os_version=$(grep "^VERSION_ID=" /etc/os-release | cut -d= -f2 | tr -d '"' || true)
+  fi
+  var_os="$os_type" var_version="$os_version" _tm_quiet _tm_post_run addon "$@"
+}
+
+# telemetry_new_attempt - a retry from the recovery menu becomes its own execution
+telemetry_new_attempt() {
+  EXECUTION_ID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "${RANDOM_UUID}-r$RANDOM")"
+  POST_TO_API_DONE=false
+  POST_UPDATE_DONE=false
+  unset FAILED_COMMAND FAILED_LINE FAILED_FUNCTION ERROR_CATEGORY_OVERRIDE TELEMETRY_ERRINFO CS_ERROR_MSG
+  unset TM_ERR_CODE TM_ERR_COMMAND TM_ERR_LINE TM_ERR_FUNCTION TM_ERR_STEP TM_ERR_MESSAGE TM_ERR_PHASE TM_ERR_OUTPUT TM_ERR_EXPLANATION
+  export EXECUTION_ID
+}
+
+# ==============================================================================
+# TOOLS & ADD-ONS
+# ==============================================================================
+
+# Under errexit, Cancel/No (1) or Esc (255) in a whiptail dialog ends the run, as
+# does whiptail without a terminal. The user decided; the tool did not fail.
+_tm_dialog_exit() {
+  [[ "$2" == 1 || "$2" == 255 ]] || return 1
+  [[ "$1" =~ ^((local|export|declare)[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=\$\()?whiptail[[:space:]] ]] && return 0
+  [[ "$2" == 1 && "$1" =~ ^(read|select)[[:space:]] ]]
+}
+
+# EXIT trap set by init_tool_telemetry. <command> is the one running when the
+# shell exited: the failing one under errexit. Tools have no ERR trap, so it is
+# the only trace of what failed.
+_telemetry_report_exit() {
+  local ec="${1:-0}" cmd="${2:-}"
+  local status="success" reason=""
+  if [[ "$ec" -ne 0 ]]; then
+    status="failed"
+    if _tm_dialog_exit "${FAILED_COMMAND:-$cmd}" "$ec"; then
+      status="aborted"
+      reason="Dialog cancelled, or no terminal to show it"
+    elif [[ -z "${FAILED_COMMAND:-}" && -n "$cmd" && ! "$cmd" =~ ^(exit|return)([[:space:]]|$) ]]; then
+      FAILED_COMMAND="$cmd"
+    fi
+  fi
+
+  local name="${TELEMETRY_TOOL_NAME:-${APP:-unknown}}"
+
+  if [[ "${TELEMETRY_TOOL_TYPE:-pve}" == "addon" ]]; then
+    post_addon_to_api "$name" "$status" "$ec" "$reason"
+  else
+    post_tool_to_api "$name" "$status" "$ec" "$reason"
+  fi
+}
+
+# init_tool_telemetry [name] [pve|addon] - one-line setup for tool and add-on scripts
+init_tool_telemetry() {
+  local name="${1:-}"
+  local type="${2:-pve}"
+
+  [[ -n "$name" ]] && TELEMETRY_TOOL_NAME="$name"
+  TELEMETRY_TOOL_TYPE="$type"
+
+  if [[ -f /usr/local/community-scripts/diagnostics ]]; then
+    DIAGNOSTICS=$(grep -i "^DIAGNOSTICS=" /usr/local/community-scripts/diagnostics 2>/dev/null | awk -F'=' '{print $2}') || true
+  fi
+  devscripts_telemetry || true
+
+  start_install_timer
+
+  trap '_telemetry_report_exit "$?" "$BASH_COMMAND"' EXIT
+}
+
+# ==============================================================================
+# TIMERS
+# ==============================================================================
+
+# Keeps a clock that is already running; post_to_api starts it at the first report.
+start_install_timer() {
+  [[ -n "${INSTALL_START_TIME:-}" ]] && return 0
+  INSTALL_START_TIME=$(date +%s)
+  export INSTALL_START_TIME
+}
+
+get_install_duration() {
+  if [[ -z "${INSTALL_START_TIME:-}" ]]; then
+    echo "0"
+    return 0
+  fi
+  local now
+  now=$(date +%s)
+  echo $((now - INSTALL_START_TIME))
+}

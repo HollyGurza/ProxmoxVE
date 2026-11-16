@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Copyright (c) 2021-2026 community-scripts ORG
+# Author: michelroegl-brunner | MickLesk
+# License: MIT | https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/LICENSE
+
+# ==============================================================================
+# API.FUNC - TELEMETRY
+# ==============================================================================
+# Anonymous install telemetry for telemetry.community-scripts.org. Opt-out via
+# DIAGNOSTICS=no (/usr/local/community-scripts/diagnostics).
+#
+# Only the host sends a terminal status (success/failed/aborted), once per
+# execution. A container leaves /root/.install-<SESSION_ID>.failed and an
+# .errinfo capture behind, which the host reads after the install returns.
+#
+#   exitcodes.func  exit status -> description and category
+#   errorlog.func   the failing step's output and the error trace
+#   sysinfo.func    repo origin, CPU, GPU, RAM, architecture
+#   telemetry.func  payload and senders
+# ==============================================================================
+
+# HollyGurza/ProxmoxVE local fork: telemetry removed, no endpoint.
+TELEMETRY_URL=""
+DIAGNOSTICS="no"
+TELEMETRY_TIMEOUT=5
+STATUS_TIMEOUT=10
+
+# Bump when a field is added, removed or changes meaning; sent as a field and in the User-Agent.
+#   1  original payload
+#   2  kernel_version, app_version, failed_command, failed_line; gpu_passthrough = actual passthrough
+#   3  error_message, error_step, error_phase, failed_function; step-scoped, noise-filtered trace
+TELEMETRY_PAYLOAD_VERSION=3
+
+TELEMETRY_ERROR_MAX_LINES=60
+TELEMETRY_ERROR_MAX_BYTES=10240
+
+# Repeated per file rather than shared: there is nowhere to put a shared copy
+# that does not itself need downloading first. See core/build.func.
+_CS_CURL_RETRY=(--retry 3 --retry-delay 1 --retry-connrefused --connect-timeout 10)
+
+_api_source_part() {
+  local part="$1"
+
+  if declare -f _cs_source_func >/dev/null 2>&1; then
+    _cs_source_func "api/${part}.func"
+    return 0
+  fi
+
+  if [[ -n "${COMMUNITY_SCRIPTS_CORE_DIR:-}" && -s "${COMMUNITY_SCRIPTS_CORE_DIR}/api/${part}.func" ]]; then
+    # shellcheck disable=SC1090
+    source "${COMMUNITY_SCRIPTS_CORE_DIR}/api/${part}.func"
+    return 0
+  fi
+  local base="${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}"
+  if command -v curl >/dev/null 2>&1; then
+    # shellcheck disable=SC1090
+    source <(curl -fsSL "${_CS_CURL_RETRY[@]}" "${base}/api/${part}.func")
+  else
+    # shellcheck disable=SC1090
+    source <(wget -qO- "${base}/api/${part}.func")
+  fi
+}
+
+_api_source_part exitcodes
+_api_source_part errorlog
+_api_source_part sysinfo
+_api_source_part telemetry

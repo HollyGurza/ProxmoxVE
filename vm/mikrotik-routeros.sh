@@ -6,7 +6,7 @@
 # https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 
 COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local}"
-source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/core/main}/pve/vm-core.func")
+source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/HollyGurza/ProxmoxVE/local/core}/pve/vm-core.func")
 load_functions
 
 GEN_MAC=$(echo '00 60 2f'$(od -An -N3 -t xC /dev/urandom) | sed -e 's/ /:/g' | tr '[:lower:]' '[:upper:]')
@@ -202,7 +202,7 @@ DISK_REF="${STORAGE}:${DISK_REF:-}${DISK_VAR:-}"
 msg_ok "Extracted Mikrotik RouterOS CHR Disk Image"
 msg_info "Creating Mikrotik RouterOS CHR VM"
 qm create $VMID${MACHINE} -tablet 0 -localtime 1${CPU_TYPE} -cores $CORE_COUNT -memory $RAM_SIZE -name $HN \
-  -tags community-script -net0 virtio,bridge=$BRG,macaddr=$MAC$VLAN$MTU \
+  -tags community-script-local -net0 virtio,bridge=$BRG,macaddr=$MAC$VLAN$MTU \
   -onboot 1 -ostype l26 -scsihw virtio-scsi-pci
 qm importdisk $VMID "$FILE" $STORAGE ${DISK_IMPORT:-} 1>&/dev/null
 qm set $VMID \
